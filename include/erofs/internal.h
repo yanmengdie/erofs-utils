@@ -159,6 +159,7 @@ struct erofs_sb_info {
 	bool useqpl;
 	bool sb_valid;
 	u32 metazone_startblk;
+	u16 rebuild_devbase; /* first output device for this rebuild source */
 };
 
 /* make sure that any user of the erofs headers has atleast 64bit off_t type */
@@ -208,6 +209,7 @@ struct erofs_diskbuf;
 #define EROFS_INODE_DATA_SOURCE_DISKBUF		2
 #define EROFS_INODE_DATA_SOURCE_RESVSP		3
 #define EROFS_INODE_DATA_SOURCE_REBUILD_BLOB	4
+#define EROFS_INODE_DATA_SOURCE_TAR		5
 
 enum erofs_idata_type {
 	EROFS_IDATA_TYPE_RAW,
@@ -258,8 +260,17 @@ struct erofs_inode {
 		char *i_link;
 		struct erofs_diskbuf *i_diskbuf;
 	};
-	char *rebuild_blobpath;
-	erofs_off_t rebuild_src_dataoff;
+	union {
+		struct {
+			char *rebuild_blobpath;
+			erofs_off_t rebuild_src_dataoff;
+		};
+		struct {
+			/* Borrowed from the tar stream until tree import completes. */
+			erofs_off_t offset;
+			int fd;
+		} tar_source;
+	};
 	unsigned char datalayout;
 	unsigned char inode_isize;
 	/* inline tail-end packing size */
@@ -269,6 +280,10 @@ struct erofs_inode {
 	char idata_type;
 	bool lazy_tailblock;
 	bool opaque;
+	bool hotfile;
+	bool hotdir;
+	bool hot_traversal_deferred;
+	u32 hot_rank;
 	/* OVL: non-merge dir that may contain whiteout entries */
 	bool whiteouts;
 	bool dot_omitted;
@@ -357,6 +372,7 @@ static inline struct erofs_inode *erofs_parent_inode(struct erofs_inode *inode)
 
 #define EROFS_DENTRY_FLAG_VALIDNID	0x01
 #define EROFS_DENTRY_FLAG_FIXUP_PNID	0x02
+#define EROFS_DENTRY_FLAG_NLINK_COUNTED	0x04
 struct erofs_dentry {
 	struct list_head d_child;	/* child of parent list */
 	union {
@@ -566,6 +582,11 @@ static inline bool erofs_is_packed_inode(struct erofs_inode *inode)
 	return erofs_sb_has_fragments(inode->sbi) &&
 		inode->sbi->packed_nid > 0 &&
 		inode->nid == inode->sbi->packed_nid;
+}
+
+static inline bool erofs_inode_is_hotfile(struct erofs_inode *inode)
+{
+	return inode->hotfile;
 }
 
 int erofs_packedfile_init(struct erofs_sb_info *sbi, bool fragments_mkfs);

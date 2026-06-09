@@ -62,6 +62,7 @@ static struct erofs_dentry *erofs_rebuild_mkdir(struct erofs_inode *dir,
 	inode->i_mtime_nsec = dir->i_mtime_nsec;
 	inode->dev = dir->dev;
 	inode->i_nlink = 2;
+	erofs_inode_set_hot(inode, inode->i_srcpath);
 
 	d = erofs_d_alloc(dir, s);
 	if (IS_ERR(d)) {

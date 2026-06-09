@@ -1117,6 +1117,7 @@ out_eot:
 
 		inode = erofs_igrab(d2->inode);
 		++inode->i_nlink;
+		erofs_inode_update_hot_file(inode, eh.path);
 		if (d->type != EROFS_FT_UNKNOWN) {
 			tarerofs_remove_inode(d->inode);
 			erofs_iput(d->inode);
@@ -1175,6 +1176,7 @@ new_inode:
 	ret = __erofs_fill_inode(im, inode, &st, eh.path);
 	if (ret)
 		goto out;
+	erofs_inode_set_hot(inode, eh.path);
 	inode->i_size = st.st_size;
 
 	if (!S_ISDIR(inode->i_mode)) {
