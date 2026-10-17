@@ -123,3 +123,13 @@ with tempfile.TemporaryDirectory(prefix='erofs-inodes-') as tmp:
     image = build('ranks', root, [], '\n'.join(order) + '\n')
     offsets = [min(start for start, _ in extents(image, '/' + name)) for name in order]
     assert all(a < b for a, b in zip(offsets, offsets[1:])), offsets
+
+    # Root overlay xattrs must not consume the reserved hot-bounds space.
+    root = work / 'whiteout-root'
+    root.mkdir()
+    (root / 'hot').write_bytes(payload)
+    (root / '.wh.gone').touch()
+    archive = work / 'whiteout-root.tar'
+    with tarfile.open(archive, 'w') as stream:
+        stream.add(root, arcname='.')
+    build('whiteout-root', archive, ['--tar=f', '--aufs'], '/hot\n')

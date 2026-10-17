@@ -268,6 +268,9 @@ int z_erofs_relayout_compressed_hotchunks(struct erofs_sb_info *sbi)
 patch_indexes:
 	for (i = 0; i < count; ++i) {
 		entries[i].extent->pstart = erofs_pos(sbi, slots[i]);
+		if (entries[i].rank != EROFS_HOT_RANK_NONE)
+			erofs_hotfile_record_extent(sbi, 0,
+				entries[i].extent->pstart, entries[i].extent->plen);
 	}
 	erofs_info("reordered %u compressed pclusters (%u hot)", count, hot);
 	z_erofs_hot_pclusters_reset();
@@ -1707,6 +1710,9 @@ int erofs_commit_compressed_file(struct z_erofs_compress_ictx *ictx,
 				  inode->i_srcpath, erofs_strerror(ret));
 			return ret;
 		}
+	} else if (erofs_inode_is_hotfile(inode)) {
+		/* Hot files bypass deduplication and fragment packing. */
+		erofs_hotfile_record_extent(sbi, ictx->device_id, pstart, ptotal);
 	}
 	return 0;
 

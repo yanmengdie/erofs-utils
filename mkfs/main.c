@@ -1798,6 +1798,9 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 	list_for_each_entry(src, &rebuild_src_list, list) {
 		if (!src->rebuild_devcount)
 			continue;
+		ret = erofs_hotfile_rebuild_bounds(&g_sbi, src);
+		if (ret)
+			return ret;
 		for (i = 0; i < src->rebuild_devcount; ++i) {
 			struct erofs_device_info *dev =
 				&g_sbi.devs[src->rebuild_devbase - 1 + i];
@@ -2245,6 +2248,11 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (!importer_params.no_xattrs) {
+		err = erofs_hotfile_write_bounds(root);
+		if (err)
+			goto exit;
+	}
 	err = erofs_importer_flush_all(&importer);
 	if (err)
 		goto exit;

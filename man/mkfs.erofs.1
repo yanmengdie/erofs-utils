@@ -339,6 +339,15 @@ support fragments, tailpacking, compressed dedupe, metadata/directory
 compression, or big pclusters.  A data section unit of one is required.  If a
 path has byte-range entries, only intersecting chunks or pclusters are treated
 as hot for that path.
+.PP
+Hot layouts store \fBuser.erofs.hot_end\fR on the root directory unless xattrs
+are disabled. The value contains one little-endian 64-bit byte offset per
+device, starting with device 0 (the metadata image). Each offset is the
+block-aligned end of a prefix covering that device's hot file data; zero means
+no hot data. It does not describe all metadata needed to traverse those files.
+Rebuild preserves these bounds for referenced blobs, remapping device indices;
+removed files may leave a conservative prefix. A fresh layout recalculates the
+attribute. Read it using the usual xattr interface; no hotlist rescan is needed.
 .TP
 .BI "\-\-hot-file-list-output=" path
 Write the resolved OCI hot paths in prefetch order. Requires a hot-file list

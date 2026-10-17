@@ -159,6 +159,7 @@ struct erofs_sb_info {
 	bool useqpl;
 	bool sb_valid;
 	u32 metazone_startblk;
+	__le64 *hot_end; /* physical prefix ends, indexed by output device */
 	u16 rebuild_devbase; /* first output device for this rebuild source */
 	u16 rebuild_devcount;
 };

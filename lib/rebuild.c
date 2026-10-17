@@ -14,6 +14,7 @@
 #include "erofs/inode.h"
 #include "erofs/dir.h"
 #include "erofs/xattr.h"
+#include "erofs/hotfile.h"
 #include "erofs/internal.h"
 #include "erofs/tar.h"
 #include "erofs/io.h"
@@ -680,6 +681,7 @@ int erofs_rebuild_load_tree(struct erofs_inode *root,
 		root->i_gid = inode.i_gid;
 		root->i_mtime = inode.i_mtime;
 		root->i_mtime_nsec = inode.i_mtime_nsec;
+		erofs_removexattr(root, EROFS_HOT_END_XATTR);
 	}
 	inode.i_srcpath = strdup("/");
 	if (!inode.i_srcpath)

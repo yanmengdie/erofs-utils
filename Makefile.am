@@ -14,9 +14,9 @@ TESTS_ENVIRONMENT = MKFS='$(abs_builddir)/mkfs/mkfs.erofs' \
 	FSCK='$(abs_builddir)/fsck/fsck.erofs'
 LOG_COMPILER = python3
 if ENABLE_LZ4
-TESTS += tests/hotfile-links.py tests/hotfile-inodes.py tests/tar-direct.py tests/hotlist-ranges.py tests/fsmerge.py
+TESTS += tests/hotfile-links.py tests/hotfile-inodes.py tests/tar-direct.py tests/hotlist-ranges.py tests/fsmerge.py tests/hotfile-bounds.py
 if ENABLE_OCI
 TESTS += tests/oci-layers.py
 endif
 endif
-EXTRA_DIST = tests/hotfile-links.py tests/hotfile-inodes.py tests/tar-direct.py tests/oci-layers.py tests/hotlist-ranges.py tests/fsmerge.py
+EXTRA_DIST = tests/hotfile-links.py tests/hotfile-inodes.py tests/tar-direct.py tests/oci-layers.py tests/hotlist-ranges.py tests/fsmerge.py tests/hotfile-bounds.py
