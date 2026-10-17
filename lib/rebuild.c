@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <config.h>
 #if defined(HAVE_SYS_SYSMACROS_H)
@@ -14,6 +15,7 @@
 #include "erofs/dir.h"
 #include "erofs/xattr.h"
 #include "erofs/internal.h"
+#include "erofs/tar.h"
 #include "erofs/io.h"
 #include "liberofs_chunk.h"
 #include "liberofs_rebuild.h"
@@ -89,7 +91,8 @@ struct erofs_dentry *erofs_d_lookup(struct erofs_inode *dir, const char *name)
 
 static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 		struct erofs_inode *pwd, char *path, bool aufs,
-		bool *whout, bool *opq, bool to_head, unsigned int depth);
+		bool *whout, bool *opq, bool to_head, u32 tar_layer,
+		unsigned int depth, struct erofs_inode **parent);
 
 static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
 		struct erofs_inode *pwd, struct erofs_inode *link,
@@ -100,7 +103,7 @@ static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
 
 	for (;;) {
 		struct erofs_dentry *d;
-		struct erofs_inode *base;
+		struct erofs_inode *base, *parent;
 
 		if (depth++ >= EROFS_REBUILD_SYMLINK_DEPTH)
 			return ERR_PTR(-ELOOP);
@@ -113,7 +116,8 @@ static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
 		/* absolute targets are resolved from the tree root */
 		base = target[0] == '/' ? root : pwd;
 		d = __erofs_rebuild_get_dentry(root, base, target, false,
-					       &dumb_wh, &dumb_opq, false, depth);
+					       &dumb_wh, &dumb_opq, false, 0,
+					       depth, &parent);
 		if (IS_ERR(d))
 			return ERR_CAST(d);
 		/* target referred to the root or base directory itself ("/", ".") */
@@ -124,14 +128,15 @@ static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
 		if (d->type != EROFS_FT_SYMLINK)
 			return ERR_PTR(-ENOTDIR);
 		/* the target is itself a symlink: keep following the chain */
-		pwd = d->inode->i_parent;
+		pwd = parent;
 		link = d->inode;
 	}
 }
 
 static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 		struct erofs_inode *pwd, char *path, bool aufs,
-		bool *whout, bool *opq, bool to_head, unsigned int depth)
+		bool *whout, bool *opq, bool to_head, u32 tar_layer,
+		unsigned int depth, struct erofs_inode **parent)
 {
 	struct erofs_dentry *d = NULL;
 	char *s = path;
@@ -169,6 +174,15 @@ static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 			}
 
 			d = erofs_d_lookup(pwd, s);
+			if (d && slash && d->type != EROFS_FT_DIR && tar_layer &&
+			    d->tar_layer < tar_layer) {
+				/* An upper implicit directory replaces a lower file. */
+				tarerofs_remove_inode(d->inode);
+				erofs_iput(d->inode);
+				list_del(&d->d_child);
+				free(d);
+				d = NULL;
+			}
 			/* follow a symlinked intermediate component like a real fs */
 			if (d && slash && d->type == EROFS_FT_SYMLINK) {
 				pwd = erofs_rebuild_follow_link(root, pwd,
@@ -181,13 +195,14 @@ static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 			}
 			if (d) {
 				if (d->type != EROFS_FT_DIR) {
-					if (slash)
+					if (slash) {
+						*slash = '/';
 						return ERR_PTR(-ENOTDIR);
+					}
 				} else if (to_head) {
 					list_del(&d->d_child);
 					list_add(&d->d_child, &pwd->i_subdirs);
 				}
-				pwd = d->inode;
 			} else if (slash) {
 				d = erofs_rebuild_mkdir(pwd, s);
 				if (IS_ERR(d))
@@ -199,6 +214,11 @@ static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 				d->type = EROFS_FT_UNKNOWN;
 				d->inode = pwd;
 			}
+			/* Whiteouts copy up ancestors, but do not replace their target. */
+			if (tar_layer && (slash || !*whout))
+				d->tar_layer = tar_layer;
+			if (parent)
+				*parent = pwd;
 			pwd = d->inode;
 		}
 
@@ -210,11 +230,19 @@ static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 	return d;
 }
 
+struct erofs_dentry *erofs_rebuild_get_dentry_layer(struct erofs_inode *pwd,
+		char *path, bool aufs, bool *whout, bool *opq, bool to_head,
+		u32 tar_layer, struct erofs_inode **parent)
+{
+	return __erofs_rebuild_get_dentry(pwd, pwd, path, aufs, whout, opq,
+					  to_head, tar_layer, 0, parent);
+}
+
 struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 		char *path, bool aufs, bool *whout, bool *opq, bool to_head)
 {
-	return __erofs_rebuild_get_dentry(pwd, pwd, path, aufs, whout, opq,
-					  to_head, 0);
+	return erofs_rebuild_get_dentry_layer(pwd, path, aufs, whout, opq,
+					    to_head, 0, NULL);
 }
 
 static int erofs_rebuild_load_chunk_index(struct erofs_sb_info *dst_sb,

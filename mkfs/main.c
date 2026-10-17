@@ -107,10 +107,14 @@ static struct option long_options[] = {
 	{"xattr-prefix", required_argument, NULL, 538},
 	{"xattr-inode-digest", optional_argument, NULL, 539},
 	{"hot-file-list", required_argument, NULL, 540},
+	{"hot-file-list-output", required_argument, NULL, 541},
+	{"hot-file-list-directory", required_argument, NULL, 542},
 	{0, 0, 0, 0},
 };
 
 static char *hotfile_list_path;
+static char *hotfile_list_output;
+static bool hotfile_list_directories;
 
 static void print_available_compressors(FILE *f, const char *delim)
 {
@@ -216,6 +220,8 @@ static void usage(int argc, char **argv)
 		" --hard-dereference     dereference hardlinks, add links as separate inodes\n"
 		" --hot-file-list=X      specify newline-separated hot file paths for\n"
 		"                        local directory, tar full, or OCI full sources\n"
+		" --hot-file-list-output=X write resolved OCI hot paths to X\n"
+		" --hot-file-list-directory=X add directory contents to OCI hot paths\n"
 		" --ignore-mtime         use build time instead of strict per-file modification time\n"
 		" --max-extent-bytes=#   set maximum decompressed extent size # in bytes\n"
 		" --mount-point=X        X=prefix of target fs path (default: /)\n"
@@ -314,7 +320,7 @@ static struct erofs_s3 s3cfg;
 #endif
 
 #ifdef OCIEROFS_ENABLED
-static struct ocierofs_config ocicfg;
+static struct ocierofs_config ocicfg = { .layer_index = -1 };
 #endif
 static bool mkfs_oci_tarindex_mode;
 
@@ -1530,6 +1536,18 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			if (!hotfile_list_path)
 				return -ENOMEM;
 			break;
+		case 541:
+			free(hotfile_list_output);
+			hotfile_list_output = strdup(optarg);
+			if (!hotfile_list_output)
+				return -ENOMEM;
+			break;
+		case 542:
+			hotfile_list_directories = true;
+			err = erofs_hotfile_add_directory(optarg);
+			if (err)
+				return err;
+			break;
 		case 'V':
 			version();
 			exit(0);
@@ -1596,6 +1614,12 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		return -EOPNOTSUPP;
 	}
 
+	if ((hotfile_list_output || hotfile_list_directories) &&
+	    (source_mode != EROFS_MKFS_SOURCE_OCI ||
+	     !mkfs_hotfile_supported_source() || !hotfile_list_path)) {
+		erofs_err("hot-file-list output and directories require OCI full mode and a hot-file-list");
+		return -EOPNOTSUPP;
+	}
 	if (quiet) {
 		cfg.c_dbg_lvl = EROFS_ERR;
 		cfg.c_showprogress = false;
@@ -2123,6 +2147,11 @@ int main(int argc, char **argv)
 		if (err)
 			goto exit;
 	}
+	if (hotfile_list_output) {
+		err = erofs_hotfile_write_list(hotfile_list_output);
+		if (err)
+			goto exit;
+	}
 	err = erofs_importer_load_tree(&importer,
 				       source_mode != EROFS_MKFS_SOURCE_LOCALDIR,
 				       incremental_mode);
@@ -2175,11 +2204,13 @@ exit:
 	erofs_hotfile_exit();
 	free(hotfile_list_path);
 	hotfile_list_path = NULL;
+	free(hotfile_list_output);
+	hotfile_list_output = NULL;
 	erofs_xattr_cleanup_name_prefixes();
 	erofs_rebuild_cleanup();
 	erofs_diskbuf_exit();
-	if (!err && source_mode == EROFS_MKFS_SOURCE_TAR) {
-		if (mkfs_aws_zinfo_file) {
+	if (tar_stream_open) {
+		if (!err && mkfs_aws_zinfo_file) {
 			struct erofs_vfile vf;
 			int fd;
 

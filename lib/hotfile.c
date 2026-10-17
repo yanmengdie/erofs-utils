@@ -960,7 +960,7 @@ int erofs_hotfile_resolve_oci(struct erofs_inode *root)
 		struct erofs_inode *inode =
 			erofs_hotfile_resolve_inode(raw[i].path, &path);
 
-		if (IS_ERR(inode) && PTR_ERR(inode) != -ENOENT) {
+		if (IS_ERR(inode) && (PTR_ERR(inode) != -ENOENT || !path)) {
 			if (PTR_ERR(inode) == -ENOMEM)
 				err = -ENOMEM;
 			else

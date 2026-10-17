@@ -15,5 +15,8 @@ TESTS_ENVIRONMENT = MKFS='$(abs_builddir)/mkfs/mkfs.erofs' \
 LOG_COMPILER = python3
 if ENABLE_LZ4
 TESTS += tests/hotfile-links.py tests/hotfile-inodes.py tests/tar-direct.py
+if ENABLE_OCI
+TESTS += tests/oci-layers.py
 endif
-EXTRA_DIST = tests/hotfile-links.py tests/hotfile-inodes.py tests/tar-direct.py
+endif
+EXTRA_DIST = tests/hotfile-links.py tests/hotfile-inodes.py tests/tar-direct.py tests/oci-layers.py

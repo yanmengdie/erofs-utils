@@ -773,6 +773,69 @@ static int tarerofs_write_file_data(struct erofs_inode *inode,
 	return nread < 0 ? nread : 0;
 }
 
+struct tarerofs_whiteout {
+	struct list_head list;
+	char path[];
+};
+
+static void tarerofs_remove_lower(struct erofs_dentry *d, u32 layer)
+{
+	struct erofs_dentry *child, *next;
+
+	if (d->type == EROFS_FT_UNKNOWN) {
+		/* A whiteout for a nonexistent file has only a placeholder. */
+		list_del(&d->d_child);
+		free(d);
+		return;
+	}
+	if (d->type == EROFS_FT_DIR) {
+		list_for_each_entry_safe(child, next, &d->inode->i_subdirs,
+					d_child)
+			tarerofs_remove_lower(child, layer);
+		/* Same-layer children can arrive through a symlinked path. */
+		if (!list_empty(&d->inode->i_subdirs))
+			return;
+	}
+	if (d->tar_layer < layer) {
+		list_del(&d->d_child);
+		tarerofs_remove_inode(d->inode);
+		erofs_iput(d->inode);
+		free(d);
+		return;
+	}
+}
+
+int tarerofs_finish_layer(struct erofs_importer *im,
+			 struct erofs_tarfile *tar, bool apply)
+{
+	struct tarerofs_whiteout *wh, *next;
+	int ret = 0;
+
+	list_for_each_entry_safe(wh, next, &tar->whiteouts, list) {
+		if (apply && !ret) {
+			struct erofs_dentry *d, *child, *n;
+			bool whout, opq;
+
+			d = erofs_rebuild_get_dentry(im->root, wh->path, true,
+						    &whout, &opq, false);
+			if (IS_ERR(d)) {
+				/* A same-layer file may have replaced this parent dir. */
+				if (PTR_ERR(d) != -ENOTDIR)
+					ret = PTR_ERR(d);
+			} else if (opq && !d) {
+				list_for_each_entry_safe(child, n,
+							&im->root->i_subdirs, d_child)
+					tarerofs_remove_lower(child, tar->layer);
+			} else if (d) {
+				tarerofs_remove_lower(d, tar->layer);
+			}
+		}
+		list_del(&wh->list);
+		free(wh);
+	}
+	return ret;
+}
+
 int tarerofs_parse_tar(struct erofs_importer *im, struct erofs_tarfile *tar)
 {
 	struct erofs_pax_header eh = tar->global;
@@ -787,7 +850,7 @@ int tarerofs_parse_tar(struct erofs_importer *im, struct erofs_tarfile *tar)
 
 	struct tar_header *th;
 	struct erofs_dentry *d;
-	struct erofs_inode *inode;
+	struct erofs_inode *inode, *parent;
 	unsigned int csum, cksum;
 	int ckksum, ret, rem, j;
 
@@ -1062,9 +1125,44 @@ out_eot:
 
 	erofs_dbg("parsing %s (mode %05o)", eh.path, st.st_mode);
 
-	d = erofs_rebuild_get_dentry(root, eh.path, tar->aufs, &whout, &opq, true);
+	d = erofs_rebuild_get_dentry_layer(root, eh.path, tar->aufs,
+					 &whout, &opq, true, tar->layer, &parent);
 	if (IS_ERR(d)) {
+		const char *base = strrchr(eh.path, '/');
+
+		base = base ? base + 1 : eh.path;
+		if (tar->layer && PTR_ERR(d) == -ENOTDIR &&
+		    !strncmp(base, ".wh.", 4)) {
+			d = NULL;
+			goto defer_whiteout;
+		}
 		ret = PTR_ERR(d);
+		goto out;
+	}
+	if (tar->layer && (whout || opq)) {
+		struct tarerofs_whiteout *wh;
+
+defer_whiteout:
+		wh = malloc(sizeof(*wh) + strlen(eh.path) + 1);
+		if (!wh) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		strcpy(wh->path, eh.path);
+		list_add_tail(&wh->list, &tar->whiteouts);
+		if (d && d->type == EROFS_FT_UNKNOWN) {
+			list_del(&d->d_child);
+			free(d);
+		}
+		ret = erofs_iostream_lskip(&tar->ios, st.st_size) ? -EIO : 0;
+		goto out;
+	}
+
+	if (opq) {
+		inode = d ? d->inode : root;
+		/* The imported tree can be consumed before xattrs are written. */
+		inode->opaque = true;
+		ret = erofs_set_opaque_xattr(inode);
 		goto out;
 	}
 
@@ -1075,16 +1173,6 @@ out_eot:
 			goto out;
 		}
 		inode = root;
-	} else if (opq) {
-		DBG_BUGON(d->type == EROFS_FT_UNKNOWN);
-		DBG_BUGON(!d->inode);
-		/*
-		 * needed if the tar tree is used soon, thus we have no chance
-		 * to generate it from xattrs.  No impact to mergefs.
-		 */
-		d->inode->opaque = true;
-		ret = erofs_set_opaque_xattr(d->inode);
-		goto out;
 	} else if (th->typeflag == '1') {	/* hard link cases */
 		struct erofs_dentry *d2;
 		bool dumb;
@@ -1130,8 +1218,6 @@ out_eot:
 		goto out;
 	} else if (d->type != EROFS_FT_UNKNOWN) {
 		if (d->type != EROFS_FT_DIR || !S_ISDIR(st.st_mode)) {
-			struct erofs_inode *parent = d->inode->i_parent;
-
 			tarerofs_remove_inode(d->inode);
 			erofs_iput(d->inode);
 			d->inode = parent;

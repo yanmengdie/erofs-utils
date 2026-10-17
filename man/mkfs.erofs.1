@@ -328,6 +328,17 @@ This is file-level data ordering: directory compression, metadata zones and
 metadata allocation can place metadata elsewhere in the image, so a complete,
 independently usable hot prefix is not guaranteed.
 This option cannot be combined with \fB--sort=none\fR for tar input.
+OCI full mode resolves paths in the merged image, follows container symlinks,
+and includes Python source counterparts of bytecode paths.
+.TP
+.BI "\-\-hot-file-list-output=" path
+Write the resolved OCI hot paths in prefetch order. Requires a hot-file list
+and OCI full mode.
+.TP
+.BI "\-\-hot-file-list-directory=" path
+Append non-directory entries below the specified OCI image directory in
+lexical order before hot-path resolution. May be repeated. Directory symlinks
+are not recursively followed. Requires a hot-file list and OCI full mode.
 .TP
 .B "\-\-ignore-mtime"
 Ignore the file modification time whenever it would cause \fBmkfs.erofs\fR to
@@ -370,6 +381,16 @@ Specify the prefix of target filesystem path (default: /).
 .TP
 .BI "\-\-oci\fR[\fP=<f|i>\fR]\fP"
 Generate a full (f) or index-only (i) image from OCI remote source.
+The source may be a tagged reference or an image digest reference
+(for example, registry/repository@sha256:...).
+When importing all layers, whiteouts and opaque directories affect only lower
+layers; entries added in the same layer are retained.
+Whole-file hotlists are resolved against the merged image tree, including
+container-rooted symbolic links and Python bytecode/source pairs. Missing or
+cyclic paths are skipped without accessing the host filesystem.
+The merged root directory is normalized to uid/gid 0, mode 0755 and epoch
+mtime; explicit uid/gid and timestamp options still apply.
+The CURL_CA_BUNDLE environment variable specifies a custom registry CA bundle.
 Additional options can be specified:
 .RS 1.2i
 .TP

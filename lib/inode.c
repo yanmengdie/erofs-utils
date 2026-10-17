@@ -177,6 +177,7 @@ struct erofs_dentry *erofs_d_alloc(struct erofs_inode *parent,
 	d->namelen = namelen;
 	d->type = EROFS_FT_UNKNOWN;
 	d->flags = 0;
+	d->tar_layer = 0;
 	list_add_tail(&d->d_child, &parent->i_subdirs);
 	return d;
 }
@@ -2455,8 +2456,7 @@ static int erofs_mkfs_dump_tree_default(const struct erofs_mkfs_btctx *ctx,
 				continue;
 
 			if (!erofs_inode_visited(inode)) {
-				DBG_BUGON(ctx->rebuild && (inode->i_nlink == 1 ||
-					  S_ISDIR(inode->i_mode)) &&
+				DBG_BUGON(ctx->rebuild && S_ISDIR(inode->i_mode) &&
 					  erofs_parent_inode(inode) != dir);
 				erofs_mark_parent_inode(inode, dir);
 
@@ -2584,8 +2584,7 @@ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 				continue;
 
 			if (!erofs_inode_visited(inode)) {
-				DBG_BUGON(ctx->rebuild && (inode->i_nlink == 1 ||
-					  S_ISDIR(inode->i_mode)) &&
+				DBG_BUGON(ctx->rebuild && S_ISDIR(inode->i_mode) &&
 					  erofs_parent_inode(inode) != dir);
 				erofs_mark_parent_inode(inode, dir);
 
