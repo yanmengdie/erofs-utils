@@ -160,6 +160,7 @@ struct erofs_sb_info {
 	bool sb_valid;
 	u32 metazone_startblk;
 	u16 rebuild_devbase; /* first output device for this rebuild source */
+	u16 rebuild_devcount;
 };
 
 /* make sure that any user of the erofs headers has atleast 64bit off_t type */

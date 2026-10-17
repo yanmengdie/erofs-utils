@@ -19,8 +19,8 @@ struct erofs_dentry *erofs_rebuild_get_dentry_layer(struct erofs_inode *pwd,
 		u32 tar_layer, struct erofs_inode **parent);
 
 int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
-			    enum erofs_rebuild_datamode mode);
-
+			    enum erofs_rebuild_datamode mode, bool inherit_root);
 int erofs_rebuild_load_basedir(struct erofs_inode *dir, u64 *nr_subdirs,
 			       unsigned int *i_nlink);
+int erofs_rebuild_count_devices(struct erofs_sb_info *sbi);
 #endif
