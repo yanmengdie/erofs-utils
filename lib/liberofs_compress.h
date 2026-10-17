@@ -23,6 +23,7 @@ void z_erofs_free_metadata(struct erofs_inode *inode);
 char *z_erofs_write_metadata(struct erofs_inode *inode);
 int erofs_begin_compressed_file(struct z_erofs_compress_ictx *ictx);
 int erofs_write_compressed_file(struct z_erofs_compress_ictx *ictx);
+int z_erofs_relayout_compressed_hotchunks(struct erofs_sb_info *sbi);
 
 int erofs_begin_compress_dir(struct erofs_importer *im,
 			     struct erofs_inode *inode);

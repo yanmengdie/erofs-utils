@@ -27,6 +27,7 @@
 #include "erofs/compress_hints.h"
 #include "../lib/compressor.h"
 #include "../lib/liberofs_chunk.h"
+#include "../lib/liberofs_compress.h"
 #include "../lib/liberofs_gzran.h"
 #include "../lib/liberofs_metabox.h"
 #include "../lib/liberofs_oci.h"
@@ -215,7 +216,10 @@ static void usage(int argc, char **argv)
 		" --gid-offset=#         add offset # to all file gids (# = id offset)\n"
 		" --hard-dereference     dereference hardlinks, add links as separate inodes\n"
 		" --hot-file-list=X      specify newline-separated hot file paths for\n"
-		"                        local directory, tar full, or OCI full sources\n"
+		"                        local directory, tar full, or OCI full sources;\n"
+		"                        TAB-separated byte ranges require local directory\n"
+		"                        sources and support block-sized chunks or\n"
+		"                        compressed 4-KiB pclusters\n"
 		" --ignore-mtime         use build time instead of strict per-file modification time\n"
 		" --max-extent-bytes=#   set maximum decompressed extent size # in bytes\n"
 		" --mount-point=X        X=prefix of target fs path (default: /)\n"
@@ -1843,6 +1847,10 @@ int main(int argc, char **argv)
 			goto exit;
 		}
 	}
+	if (erofs_hotchunk_enabled() && mkfscfg.zcfgs[0].alg) {
+		importer_params.no_zcompact = true;
+		mkfs_no_datainline = true;
+	}
 
 	err = parse_source_date_epoch();
 	if (err) {
@@ -1964,6 +1972,29 @@ int main(int argc, char **argv)
 	err = erofs_importer_init(&importer);
 	if (err)
 		goto exit;
+	if (erofs_hotchunk_enabled()) {
+		if (source_mode != EROFS_MKFS_SOURCE_LOCALDIR ||
+		    mkfscfg.blobdev_path || dsunit > 1) {
+			erofs_err("hot byte ranges require a local directory, internal data, and dsunit=1");
+			err = -EOPNOTSUPP;
+			goto exit;
+		}
+		if (g_sbi.available_compr_algs) {
+			if (g_sbi.blkszbits != 12 || mkfscfg.chunkbits ||
+			    importer_params.pclusterblks_max != 1 ||
+			    importer_params.fragments || importer_params.ztailpacking ||
+			    importer_params.dedupe == EROFS_DEDUPE_FORCE_ON ||
+			    importer_params.compress_dir || erofs_sb_has_metabox(&g_sbi)) {
+				erofs_err("compressed hot byte ranges require 4-KiB pclusters without chunk mode, fragments, tailpacking, dedupe, or metadata/directory compression");
+				err = -EOPNOTSUPP;
+				goto exit;
+			}
+		} else if (mkfscfg.chunkbits != g_sbi.blkszbits) {
+			erofs_err("uncompressed hot byte ranges require block-sized chunks");
+			err = -EOPNOTSUPP;
+			goto exit;
+		}
+	}
 
 	if (importer_params.dedupe == EROFS_DEDUPE_FORCE_ON &&
 	    g_sbi.available_compr_algs) {
@@ -2102,6 +2133,13 @@ int main(int argc, char **argv)
 				       incremental_mode);
 	if (err)
 		goto exit;
+	if (erofs_hotchunk_enabled()) {
+		err = g_sbi.available_compr_algs ?
+			z_erofs_relayout_compressed_hotchunks(&g_sbi) :
+			erofs_relayout_hot_chunks(&g_sbi);
+		if (err)
+			goto exit;
+	}
 
 	if (tar_index_512b) {
 		if (!g_sbi.extra_devices) {

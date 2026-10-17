@@ -333,6 +333,15 @@ metadata allocation can place metadata elsewhere in the image, so a complete,
 independently usable hot prefix is not guaranteed.
 This option cannot be combined with \fB--incremental\fR.
 This option cannot be combined with \fB--sort=none\fR for tar input.
+
+For local directory sources, an entry may append a byte offset and length,
+separated by tabs.  Byte-range entries support either an internal uncompressed
+blob with block-sized chunks or compressed files with 4-KiB pclusters.  The
+compressed form promotes the pcluster containing each listed range and does not
+support fragments, tailpacking, compressed dedupe, metadata/directory
+compression, or big pclusters.  A data section unit of one is required.  If a
+path has byte-range entries, only intersecting chunks or pclusters are treated
+as hot for that path.
 .TP
 .B "\-\-ignore-mtime"
 Ignore the file modification time whenever it would cause \fBmkfs.erofs\fR to

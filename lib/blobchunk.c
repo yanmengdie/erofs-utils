@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "erofs/print.h"
 #include "erofs/block_list.h"
+#include "erofs/hotfile.h"
 #include "erofs/importer.h"
 #include "liberofs_cache.h"
 #include "liberofs_chunk.h"
@@ -25,10 +26,12 @@ struct erofs_chunkitem {
 		};
 		erofs_blk_t	blkaddr;
 	};
+	unsigned int hot_rank;
 };
 
 struct erofs_chunkitem erofs_holechunk = {
 	.blkaddr = EROFS_NULL_ADDR,
+	.hot_rank = EROFS_HOT_RANK_NONE,
 };
 
 struct erofs_chunkmgr {
@@ -60,6 +63,7 @@ struct erofs_chunkitem *erofs_get_unhashed_chunk(struct erofs_sb_info *sbi,
 	chunk->device_id = device_id;
 	chunk->blkaddr = blkaddr;
 	chunk->sourceoffset = sourceoffset;
+	chunk->hot_rank = EROFS_HOT_RANK_NONE;
 	list_add_tail(&chunk->list, &chunkmgr->unhashed_chunks);
 	return chunk;
 }
@@ -121,6 +125,7 @@ static struct erofs_chunkitem *erofs_get_chunk(struct erofs_sb_info *sbi,
 		return ERR_PTR(-ENOMEM);
 
 	chunk->chunksize = size;
+	chunk->hot_rank = EROFS_HOT_RANK_NONE;
 	memcpy(chunk->sha256, sha256, sizeof(sha256));
 
 	chunk->device_id = device_id;
@@ -333,6 +338,9 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 	erofs_off_t pos, len, chunksize, interval_start;
 	erofs_blk_t minextblks;
 	u8 *chunkdata;
+	bool ranged = erofs_hotfile_has_chunk_ranges(inode->dev,
+						     inode->i_ino[1]);
+	unsigned int file_rank = ranged ? EROFS_HOT_RANK_NONE : inode->hot_rank;
 	ssize_t ret;
 
 	/* if the file is fully sparsed, use one big chunk instead */
@@ -421,6 +429,13 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 			ret = PTR_ERR(chunk);
 			goto err;
 		}
+		{
+			unsigned int rank = ranged ? erofs_get_hot_chunk_rank(
+				inode->dev, inode->i_ino[1], pos, len) : file_rank;
+
+			if (rank < chunk->hot_rank)
+				chunk->hot_rank = rank;
+		}
 
 		if (!erofs_blob_can_merge(sbi, lastch, chunk)) {
 			erofs_update_minextblks(sbi, interval_start, pos,
@@ -433,6 +448,9 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 	erofs_update_minextblks(sbi, interval_start, pos, &minextblks);
 	inode->datalayout = EROFS_INODE_CHUNK_BASED;
 	free(chunkdata);
+	/* Relayout can break adjacency for every inode sharing deduplicated chunks. */
+	if (erofs_hotchunk_enabled() || file_rank != EROFS_HOT_RANK_NONE)
+		return erofs_blob_mergechunks(inode, chunkbits, chunkbits);
 	return erofs_blob_mergechunks(inode, chunkbits,
 				      ilog2(minextblks) + sbi->blkszbits);
 err:
@@ -557,6 +575,96 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 	return 0;
 }
 
+static int erofs_hot_chunk_cmp(const void *a, const void *b)
+{
+	const struct erofs_chunkitem *lhs = *(void **)a, *rhs = *(void **)b;
+
+	if (lhs->hot_rank != rhs->hot_rank)
+		return lhs->hot_rank < rhs->hot_rank ? -1 : 1;
+	return (lhs->blkaddr > rhs->blkaddr) - (lhs->blkaddr < rhs->blkaddr);
+}
+
+static int erofs_hot_slot_cmp(const void *a, const void *b)
+{
+	erofs_blk_t lhs = *(const erofs_blk_t *)a, rhs = *(const erofs_blk_t *)b;
+
+	return (lhs > rhs) - (lhs < rhs);
+}
+
+int erofs_relayout_hot_chunks(struct erofs_sb_info *sbi)
+{
+	struct erofs_chunkmgr *cmgr = sbi->chunkmgr;
+	struct erofs_chunkitem *chunk, **chunks;
+	erofs_blk_t *slots;
+	struct erofs_vfile tmp;
+	size_t nr = 0, i;
+	u8 *buf;
+	int ret = 0;
+
+	if (!erofs_hotchunk_enabled() || !cmgr)
+		return 0;
+	for (i = 0; i < EROFS_CHUNK_NR_BUCKETS; ++i)
+		list_for_each_entry(chunk, &cmgr->chunks[i], list)
+			nr += chunk->blkaddr != EROFS_NULL_ADDR;
+	if (!nr)
+		return 0;
+	chunks = malloc(nr * sizeof(*chunks));
+	slots = malloc(nr * sizeof(*slots));
+	buf = malloc(erofs_blksiz(sbi));
+	if (!chunks || !slots || !buf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	nr = 0;
+	for (i = 0; i < EROFS_CHUNK_NR_BUCKETS; ++i) {
+		list_for_each_entry(chunk, &cmgr->chunks[i], list) {
+			if (chunk->blkaddr == EROFS_NULL_ADDR)
+				continue;
+			if (chunk->device_id || chunk->chunksize > erofs_blksiz(sbi)) {
+				ret = -EOPNOTSUPP;
+				goto out;
+			}
+			slots[nr] = chunk->blkaddr;
+			chunks[nr++] = chunk;
+		}
+	}
+	qsort(chunks, nr, sizeof(*chunks), erofs_hot_chunk_cmp);
+	qsort(slots, nr, sizeof(*slots), erofs_hot_slot_cmp);
+	tmp = (struct erofs_vfile){ .fd = erofs_os_tmpfile() };
+	if (tmp.fd < 0) {
+		ret = tmp.fd;
+		goto out;
+	}
+	for (i = 0; i < nr; ++i) {
+		ret = erofs_blk_read(sbi, 0, buf, chunks[i]->blkaddr, 1);
+		if (ret)
+			goto close_tmp;
+		if (erofs_io_pwrite(&tmp, buf, erofs_pos(sbi, i),
+				    erofs_blksiz(sbi)) != erofs_blksiz(sbi)) {
+			ret = -EIO;
+			goto close_tmp;
+		}
+	}
+	for (i = 0; i < nr; ++i) {
+		if (erofs_io_pread(&tmp, buf, erofs_blksiz(sbi),
+				   erofs_pos(sbi, i)) != erofs_blksiz(sbi)) {
+			ret = -EIO;
+			goto close_tmp;
+		}
+		ret = erofs_blk_write(sbi, buf, slots[i], 1);
+		if (ret)
+			goto close_tmp;
+		chunks[i]->blkaddr = slots[i];
+	}
+close_tmp:
+	close(tmp.fd);
+out:
+	free(buf);
+	free(slots);
+	free(chunks);
+	return ret;
+}
+
 static int erofs_insert_zerochunk(struct erofs_chunkmgr *cmgr,
 				  unsigned int cbitsdef)
 {
@@ -579,6 +687,7 @@ static int erofs_insert_zerochunk(struct erofs_chunkmgr *cmgr,
 		return -ENOMEM;
 
 	chunk->chunksize = chunksize;
+	chunk->hot_rank = EROFS_HOT_RANK_NONE;
 	/* treat chunk filled with zeros as hole */
 	chunk->blkaddr = erofs_holechunk.blkaddr;
 	memcpy(chunk->sha256, sha256, sizeof(sha256));
