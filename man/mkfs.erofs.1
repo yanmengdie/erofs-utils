@@ -609,6 +609,28 @@ algorithms with \fB-z\fR and use matching block sizes. TAR overlays require the
 default blob-index import mode, without incremental or tar-index mode.
 A source with external devices must store non-inline file data on those devices.
 Root metadata comes from the highest EROFS source, unless the TAR replaces it.
+A standalone TAR without a root entry uses mode 0755 and uid/gid 0, subject to
+explicit ownership options.
+.TP
+.B REPRODUCIBLE BUILDS
+Use the same resolved OCI manifest or TAR bytes, including metadata, and pin
+erofs-utils and compression-library versions. Fix effective layout options,
+including block size, compression settings and build time. For example, use
+\fB-b4096 -T0 --mkfs-time --preserve-mtime -U UUID\fR to retain input mtimes while
+fixing the build timestamp. Control or unset \fBSOURCE_DATE_EPOCH\fR, which
+otherwise overrides the timestamp policy.
+.PP
+Compute UUID before calling mkfs, using a stable namespace and UUIDv5 over an
+unambiguous serialization of the source identity (including parent layers when
+relevant), the original hotlist digest and the effective build profile.
+The profile must identify output-affecting options and tool/codec versions.
+Do not include host paths, host architecture or wall-clock time. Cross-host
+builds must select the same target-platform manifest, rather than each host's
+native platform. Different filesystem artifacts must not share a constant UUID.
+.PP
+The resolved hotlist output is optional and is not required to derive the UUID.
+Compare complete image and external-blob digests when validating reproducibility;
+a matching UUID alone does not prove byte-for-byte identity across platforms.
 .SH AUTHOR
 This version of \fBmkfs.erofs\fR is written by Li Guifu <blucerlee@gmail.com>,
 Miao Xie <miaoxie@huawei.com> and Gao Xiang <xiang@kernel.org> with

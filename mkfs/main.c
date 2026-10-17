@@ -2138,6 +2138,15 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* A TAR without a root entry must not inherit the builder's identity. */
+	if (source_mode == EROFS_MKFS_SOURCE_TAR) {
+		root->i_mode = S_IFDIR | 0755;
+		root->i_uid = importer_params.fixed_uid == (u32)-1 ? 0 :
+			importer_params.fixed_uid;
+		root->i_gid = importer_params.fixed_gid == (u32)-1 ? 0 :
+			importer_params.fixed_gid;
+	}
+
 	importer.root = root;
 	if (source_mode == EROFS_MKFS_SOURCE_TAR) {
 		if (rebuild_src_count) {
