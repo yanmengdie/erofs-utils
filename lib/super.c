@@ -187,6 +187,8 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 
 void erofs_put_super(struct erofs_sb_info *sbi)
 {
+	free(sbi->hot_end);
+	sbi->hot_end = NULL;
 	erofs_chunkmgr_exit(sbi);
 	if (sbi->devs) {
 		int i;

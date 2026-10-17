@@ -2154,6 +2154,11 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (!importer_params.no_xattrs) {
+		err = erofs_hotfile_write_bounds(root);
+		if (err)
+			goto exit;
+	}
 	err = erofs_importer_flush_all(&importer);
 	if (err)
 		goto exit;

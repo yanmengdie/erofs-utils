@@ -14,6 +14,6 @@ TESTS_ENVIRONMENT = MKFS='$(abs_builddir)/mkfs/mkfs.erofs' \
 	FSCK='$(abs_builddir)/fsck/fsck.erofs'
 LOG_COMPILER = python3
 if ENABLE_LZ4
-TESTS += tests/hotlist-ranges.py
+TESTS += tests/hotlist-ranges.py tests/hotfile-bounds.py
 endif
-EXTRA_DIST = tests/hotlist-ranges.py
+EXTRA_DIST = tests/hotlist-ranges.py tests/hotfile-bounds.py

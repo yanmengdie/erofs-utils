@@ -342,6 +342,18 @@ support fragments, tailpacking, compressed dedupe, metadata/directory
 compression, or big pclusters.  A data section unit of one is required.  If a
 path has byte-range entries, only intersecting chunks or pclusters are treated
 as hot for that path.
+.PP
+Hot layouts store \fBuser.erofs.hot_end\fR on the root directory unless xattrs
+are disabled.  The value contains one little-endian 64-bit byte offset per
+device, starting with device 0.  Each offset is the block-aligned end of a
+prefix covering that device's hot file data; zero means no hot data.
+Together with \fB--MZ\fR, metadata is placed in a separate zone after the
+data, whose start is already recorded in the image, so this offset is the only
+extra information a reader needs to prefetch the hot data.  Without
+\fB--MZ\fR, metadata may precede or interleave with data and is not described
+by this value.
+A fresh layout recalculates the attribute.  Read it using the usual xattr
+interface; no hotlist rescan is needed.
 .TP
 .B "\-\-ignore-mtime"
 Ignore the file modification time whenever it would cause \fBmkfs.erofs\fR to

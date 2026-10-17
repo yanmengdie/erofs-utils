@@ -11,7 +11,15 @@ extern "C"
 
 struct erofs_inode;
 
+struct erofs_sb_info;
+
+#define EROFS_HOT_END_XATTR "user.erofs.hot_end"
+
 int erofs_hotfile_load(const char *path, const char *root);
+int erofs_hotfile_reserve_bounds(struct erofs_inode *root);
+int erofs_hotfile_write_bounds(struct erofs_inode *root);
+void erofs_hotfile_record_extent(struct erofs_sb_info *sbi,
+				unsigned int device, u64 start, u64 length);
 int erofs_hotfile_prepare_tree(struct erofs_inode *root);
 void erofs_hotfile_exit(void);
 bool erofs_hotfile_enabled(void);

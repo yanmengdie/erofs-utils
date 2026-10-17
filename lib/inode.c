@@ -1186,6 +1186,16 @@ static int erofs_write_tail_end(struct erofs_importer *im,
 		else if (ret < erofs_blksiz(sbi))
 			return -EIO;
 
+		if (S_ISREG(inode->i_mode) && erofs_inode_is_hotfile(inode)) {
+			unsigned int device;
+
+			for (device = 0; device < sbi->extra_devices; ++device)
+				if (sbi->devs[device].bmgr == bmgr)
+					break;
+			erofs_hotfile_record_extent(sbi,
+				device == sbi->extra_devices ? 0 : device + 1,
+				pos, erofs_blksiz(sbi));
+		}
 		inode->idata_size = 0;
 		free(inode->idata);
 		inode->idata = NULL;
@@ -1614,9 +1624,16 @@ static int erofs_mkfs_handle_nondirectory(const struct erofs_mkfs_btctx *btctx,
 	}
 	if (ret)
 		return ret;
-	erofs_prepare_inode_buffer(btctx->im, inode);
-	erofs_write_tail_end(btctx->im, inode);
-	return 0;
+	ret = erofs_prepare_inode_buffer(btctx->im, inode);
+	if (ret)
+		return ret;
+	ret = erofs_write_tail_end(btctx->im, inode);
+	if (!ret && S_ISREG(inode->i_mode) && erofs_inode_is_hotfile(inode) &&
+	    inode->datalayout == EROFS_INODE_FLAT_PLAIN && inode->i_size)
+		erofs_hotfile_record_extent(inode->sbi,
+			inode->u.i_blkaddr >> EROFS_I_BLKADDR_DEV_ID_BIT,
+			erofs_pos(inode->sbi, erofs_inode_dev_baddr(inode)), inode->i_size);
+	return ret;
 }
 
 static int erofs_mkfs_create_directory(const struct erofs_mkfs_btctx *ctx,
@@ -2183,6 +2200,12 @@ static int erofs_mkfs_handle_inode(const struct erofs_mkfs_btctx *ctx,
 		erofs_clear_opaque_xattr(inode);
 	else if (inode->whiteouts)
 		erofs_set_origin_xattr(inode);
+
+	if (IS_ROOT(inode) && !params->no_xattrs) {
+		ret = erofs_hotfile_reserve_bounds(inode);
+		if (ret)
+			return ret;
+	}
 
 	if (!S_ISDIR(inode->i_mode)) {
 		ret = erofs_mkfs_begin_nondirectory(ctx, inode);

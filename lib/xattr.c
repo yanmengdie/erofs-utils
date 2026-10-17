@@ -580,7 +580,7 @@ int erofs_vfs_setxattr(struct erofs_inode *inode, const char *name,
 	return erofs_setxattr(inode, 0, name, value, size);
 }
 
-static void erofs_removexattr(struct erofs_inode *inode, const char *key)
+void erofs_removexattr(struct erofs_inode *inode, const char *key)
 {
 	struct erofs_inode_xattr_node *node, *n;
 

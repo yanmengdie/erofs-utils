@@ -159,6 +159,7 @@ struct erofs_sb_info {
 	bool useqpl;
 	bool sb_valid;
 	u32 metazone_startblk;
+	__le64 *hot_end; /* physical prefix ends, indexed by output device */
 };
 
 /* make sure that any user of the erofs headers has atleast 64bit off_t type */

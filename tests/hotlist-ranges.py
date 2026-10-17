@@ -5,12 +5,22 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import struct
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
 mkfs = os.environ.get('MKFS', str(root / 'mkfs/mkfs.erofs'))
 dump = os.environ.get('DUMP', str(root / 'dump/dump.erofs'))
 fsck = os.environ.get('FSCK', str(root / 'fsck/fsck.erofs'))
+
+
+def getxattr(path, name):
+    """os.getxattr on Linux, xattr(1) on macOS."""
+    if hasattr(os, 'getxattr'):
+        return os.getxattr(path, name)
+    out = subprocess.run(['xattr', '-px', name, str(path)], check=True,
+                         capture_output=True, text=True).stdout
+    return bytes.fromhex(''.join(out.split()))
 
 
 def run(*args):
@@ -42,6 +52,10 @@ with tempfile.TemporaryDirectory(prefix='erofs-ranges-') as tmp:
             assert hot and hot[0] == min(p for _, _, p in extents), text
             out = base / ('out-' + mode.lstrip('-').replace('=', '-') + str(workers))
             run(fsck, '--xattrs', '--extract=' + str(out), str(image))
+            extent_ends = [tuple(map(int, m)) for m in re.findall(
+                r'\d+:\s*(\d+)\.\.\s*(\d+)\s*\|\s*\d+\s*:\s*\d+\.\.\s*(\d+)', text)]
+            expected_end = max(p for start, end, p in extent_ends if start < 102400 and end > 98304)
+            assert struct.unpack('<Q', getxattr(out, 'user.erofs.hot_end')) == (expected_end,), (mode, getxattr(out, 'user.erofs.hot_end').hex(), expected_end, text)
             for name in ['a-cold', 'z-hot', 'alias']:
                 assert (out / name).read_bytes() == data, (mode, workers, name)
             assert os.stat(out / 'z-hot').st_ino == os.stat(out / 'alias').st_ino

@@ -14,6 +14,7 @@
 #include "erofs/hotfile.h"
 #include "erofs/inode.h"
 #include "erofs/print.h"
+#include "erofs/xattr.h"
 
 struct erofs_hotfile_entry {
 	char *path;
@@ -795,3 +796,66 @@ void erofs_hotfile_exit(void)
 	hotfile_prepared = false;
 	hotfile_has_entries = false;
 }
+
+static int erofs_hotfile_init_bounds(struct erofs_sb_info *sbi)
+{
+	unsigned int size = (sbi->extra_devices + 1U) * sizeof(__le64);
+
+	if (sbi->hot_end)
+		return 0;
+	if (size > UINT16_MAX)
+		return -EOVERFLOW;
+	sbi->hot_end = calloc(1, size);
+	return sbi->hot_end ? 0 : -ENOMEM;
+}
+
+int erofs_hotfile_reserve_bounds(struct erofs_inode *root)
+{
+	struct erofs_sb_info *sbi = root->sbi;
+	int ret;
+
+	erofs_removexattr(root, EROFS_HOT_END_XATTR);
+	if (!sbi->hot_end && !erofs_hotfile_enabled())
+		return 0;
+	ret = erofs_hotfile_init_bounds(sbi);
+	if (ret)
+		return ret;
+	/* Reserve space before placement; fill it before the final inode flush. */
+	ret = erofs_prepare_xattr_ibody(root, false);
+	if (ret)
+		return ret;
+	root->xattr_isize = max_t(unsigned int, root->xattr_isize,
+		sizeof(struct erofs_xattr_ibody_header)) + EROFS_XATTR_ALIGN(
+		sizeof(struct erofs_xattr_entry) +
+		sizeof(EROFS_HOT_END_XATTR) - sizeof("user.") +
+		(sbi->extra_devices + 1U) * sizeof(__le64));
+	return 0;
+}
+
+int erofs_hotfile_write_bounds(struct erofs_inode *root)
+{
+	struct erofs_sb_info *sbi = root->sbi;
+	int ret;
+
+	if (!sbi->hot_end)
+		return 0;
+	ret = erofs_vfs_setxattr(root, EROFS_HOT_END_XATTR, sbi->hot_end,
+			       (sbi->extra_devices + 1U) * sizeof(__le64));
+	if (ret)
+		return ret;
+	return erofs_prepare_xattr_ibody(root, true);
+}
+
+void erofs_hotfile_record_extent(struct erofs_sb_info *sbi,
+				unsigned int device, u64 start, u64 length)
+{
+	u64 end;
+
+	if (!sbi->hot_end || !length)
+		return;
+	DBG_BUGON(device > sbi->extra_devices);
+	end = round_up(start + length, erofs_blksiz(sbi));
+	sbi->hot_end[device] = cpu_to_le64(max_t(u64, end,
+				le64_to_cpu(sbi->hot_end[device])));
+}
+

@@ -435,6 +435,10 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 
 			if (rank < chunk->hot_rank)
 				chunk->hot_rank = rank;
+			if (!erofs_hotchunk_enabled() && rank != EROFS_HOT_RANK_NONE &&
+			    chunk->blkaddr != EROFS_NULL_ADDR)
+				erofs_hotfile_record_extent(sbi, device_id,
+					erofs_pos(sbi, chunk->blkaddr), len);
 		}
 
 		if (!erofs_blob_can_merge(sbi, lastch, chunk)) {
@@ -655,6 +659,9 @@ int erofs_relayout_hot_chunks(struct erofs_sb_info *sbi)
 		if (ret)
 			goto close_tmp;
 		chunks[i]->blkaddr = slots[i];
+		if (chunks[i]->hot_rank != EROFS_HOT_RANK_NONE)
+			erofs_hotfile_record_extent(sbi, 0,
+				erofs_pos(sbi, slots[i]), erofs_blksiz(sbi));
 	}
 close_tmp:
 	close(tmp.fd);
