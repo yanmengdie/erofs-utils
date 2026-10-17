@@ -26,6 +26,7 @@ void erofs_bind_compressed_file_with_vfile(struct z_erofs_compress_ictx *ictx,
 					    u64 fpos);
 int erofs_begin_compressed_file(struct z_erofs_compress_ictx *ictx);
 int erofs_write_compressed_file(struct z_erofs_compress_ictx *ictx);
+int z_erofs_relayout_compressed_hotchunks(struct erofs_sb_info *sbi);
 
 int erofs_begin_compress_dir(struct erofs_importer *im,
 			     struct erofs_inode *inode);

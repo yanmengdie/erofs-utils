@@ -19,6 +19,7 @@
 #include "compressor.h"
 #include "erofs/block_list.h"
 #include "erofs/compress_hints.h"
+#include "erofs/hotfile.h"
 #ifdef EROFS_MT_ENABLED
 #include "erofs/workqueue.h"
 #endif
@@ -143,6 +144,144 @@ struct z_erofs_mgr {
 };
 
 static bool z_erofs_mt_enabled;
+
+struct z_erofs_hot_pcluster {
+	struct z_erofs_inmem_extent *extent;
+	erofs_blk_t blkaddr;
+	unsigned int rank;
+};
+
+static struct {
+	struct z_erofs_hot_pcluster *entries;
+	unsigned int count;
+	unsigned int capacity;
+} z_erofs_hot_pclusters;
+#ifdef EROFS_MT_ENABLED
+static pthread_mutex_t z_erofs_hot_pclusters_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static int z_erofs_register_hot_pclusters(struct erofs_inode *inode);
+
+static int z_erofs_hot_pcluster_cmp(const void *a, const void *b)
+{
+	const struct z_erofs_hot_pcluster *lhs = a, *rhs = b;
+
+	if (lhs->rank != rhs->rank)
+		return lhs->rank < rhs->rank ? -1 : 1;
+	if (lhs->blkaddr == rhs->blkaddr)
+		return 0;
+	return lhs->blkaddr < rhs->blkaddr ? -1 : 1;
+}
+
+static int z_erofs_blkaddr_cmp(const void *a, const void *b)
+{
+	const erofs_blk_t lhs = *(const erofs_blk_t *)a;
+	const erofs_blk_t rhs = *(const erofs_blk_t *)b;
+
+	return lhs < rhs ? -1 : lhs > rhs;
+}
+
+static void z_erofs_hot_pclusters_reset(void)
+{
+	free(z_erofs_hot_pclusters.entries);
+	z_erofs_hot_pclusters.entries = NULL;
+	z_erofs_hot_pclusters.count = 0;
+	z_erofs_hot_pclusters.capacity = 0;
+}
+
+int z_erofs_relayout_compressed_hotchunks(struct erofs_sb_info *sbi)
+{
+	struct z_erofs_hot_pcluster *entries = z_erofs_hot_pclusters.entries;
+	unsigned int count = z_erofs_hot_pclusters.count, hot = 0, i;
+	erofs_blk_t *slots;
+	struct erofs_vfile tmp;
+	u8 *buf;
+	int fd, ret = 0;
+
+	if (!erofs_hotchunk_enabled())
+		return 0;
+	if (!count) {
+		erofs_err("no compressed pclusters matched hot byte ranges");
+		return -EOPNOTSUPP;
+	}
+	slots = malloc(count * sizeof(*slots));
+	if (!slots)
+		return -ENOMEM;
+	for (i = 0; i < count; ++i) {
+		slots[i] = entries[i].blkaddr;
+		if (entries[i].rank != EROFS_HOT_RANK_NONE)
+			++hot;
+	}
+	if (!hot) {
+		erofs_err("no compressed pclusters matched hot byte ranges");
+		ret = -EOPNOTSUPP;
+		goto out_slots;
+	}
+	qsort(slots, count, sizeof(*slots), z_erofs_blkaddr_cmp);
+	qsort(entries, count, sizeof(*entries), z_erofs_hot_pcluster_cmp);
+	for (i = 1; i < count; ++i) {
+		if (slots[i] == slots[i - 1]) {
+			erofs_err("shared compressed pclusters are unsupported with hot byte ranges");
+			ret = -EOPNOTSUPP;
+			goto out_slots;
+		}
+	}
+	for (i = 0; i < count && entries[i].blkaddr == slots[i]; ++i)
+		;
+	if (i == count)
+		goto patch_indexes;
+
+	fd = erofs_os_tmpfile();
+	if (fd < 0) {
+		ret = fd;
+		goto out_slots;
+	}
+	tmp = (struct erofs_vfile) { .fd = fd };
+	buf = malloc(erofs_blksiz(sbi));
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out_tmp;
+	}
+	for (i = 0; i < count; ++i) {
+		ret = erofs_blk_read(sbi, 0, buf, entries[i].blkaddr, 1);
+		if (ret)
+			goto out_buf;
+		if (erofs_io_pwrite(&tmp, buf, erofs_pos(sbi, i),
+				    erofs_blksiz(sbi)) != erofs_blksiz(sbi)) {
+			ret = -EIO;
+			goto out_buf;
+		}
+	}
+	for (i = 0; i < count; ++i) {
+		if (erofs_io_pread(&tmp, buf, erofs_blksiz(sbi),
+				   erofs_pos(sbi, i)) != erofs_blksiz(sbi)) {
+			ret = -EIO;
+			goto out_buf;
+		}
+		ret = erofs_blk_write(sbi, buf, slots[i], 1);
+		if (ret)
+			goto out_buf;
+	}
+	free(buf);
+	close(fd);
+
+patch_indexes:
+	for (i = 0; i < count; ++i) {
+		entries[i].extent->pstart = erofs_pos(sbi, slots[i]);
+	}
+	erofs_info("reordered %u compressed pclusters (%u hot)", count, hot);
+	z_erofs_hot_pclusters_reset();
+	free(slots);
+	return 0;
+
+out_buf:
+	free(buf);
+out_tmp:
+	close(fd);
+out_slots:
+	free(slots);
+	return ret;
+}
 
 struct z_erofs_index_writer {
 	struct erofs_inode *inode;
@@ -1084,6 +1223,61 @@ struct z_erofs_metadata_ctx {
 	struct list_head extents;
 };
 
+static int z_erofs_register_hot_pclusters(struct erofs_inode *inode)
+{
+	struct z_erofs_metadata_ctx *ctx = inode->compressmeta;
+	struct z_erofs_hot_pcluster *entries;
+	struct z_erofs_extent_item *ei;
+	unsigned int count = 0, oldcount;
+	u64 offset = 0;
+	bool ranged = erofs_hotfile_has_chunk_ranges(inode->dev, inode->i_ino[1]);
+	int ret = 0;
+
+	list_for_each_entry(ei, &ctx->extents, list) {
+		if (ei->e.device_id || ei->e.inlined || ei->e.partial ||
+		    ei->e.plen != erofs_blksiz(inode->sbi) ||
+		    erofs_blkoff(inode->sbi, ei->e.pstart))
+			return -EOPNOTSUPP;
+		++count;
+	}
+#ifdef EROFS_MT_ENABLED
+	pthread_mutex_lock(&z_erofs_hot_pclusters_lock);
+#endif
+	oldcount = z_erofs_hot_pclusters.count;
+	if (count > UINT_MAX - oldcount) {
+		ret = -EOVERFLOW;
+		goto out;
+	}
+	if (z_erofs_hot_pclusters.capacity - oldcount < count) {
+		unsigned int capacity = max(oldcount + count,
+					   z_erofs_hot_pclusters.capacity * 2);
+
+		entries = realloc(z_erofs_hot_pclusters.entries,
+				  (size_t)capacity * sizeof(*entries));
+		if (!entries) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		z_erofs_hot_pclusters.entries = entries;
+		z_erofs_hot_pclusters.capacity = capacity;
+	}
+	list_for_each_entry(ei, &ctx->extents, list) {
+		z_erofs_hot_pclusters.entries[z_erofs_hot_pclusters.count++] =
+			(struct z_erofs_hot_pcluster) {
+				.extent = &ei->e,
+				.blkaddr = erofs_blknr(inode->sbi, ei->e.pstart),
+				.rank = ranged ? erofs_get_hot_chunk_rank(inode->dev,
+					inode->i_ino[1], offset, ei->e.length) : inode->hot_rank,
+			};
+		offset += ei->e.length;
+	}
+out:
+#ifdef EROFS_MT_ENABLED
+	pthread_mutex_unlock(&z_erofs_hot_pclusters_lock);
+#endif
+	return ret;
+}
+
 static int z_erofs_prepare_layout(struct erofs_inode *inode,
 				  struct list_head *extents,
 				  bool consecutive, bool no_compact)
@@ -1109,7 +1303,7 @@ static int z_erofs_prepare_layout(struct erofs_inode *inode,
 	}
 
 	/* TODO: support writing encoded extents for ztailpacking later. */
-	if (erofs_sb_has_48bit(sbi) && !inode->idata_size) {
+	if (!erofs_hotchunk_enabled() && erofs_sb_has_48bit(sbi) && !inode->idata_size) {
 		bool pstart_hi = false, unaligned_data = false;
 		unsigned int lclusterbits, nexts;
 		struct z_erofs_extent_item *ei;
@@ -1477,7 +1671,7 @@ int erofs_commit_compressed_file(struct z_erofs_compress_ictx *ictx,
 		goto err_free_idata;
 
 	/* estimate if data compression saves space or not */
-	if (!inode->fragment_size && ptotal + inode->idata_size +
+	if (!erofs_hotchunk_enabled() && !inode->fragment_size && ptotal + inode->idata_size +
 	    inode->extent_isize >= inode->i_size) {
 		z_erofs_dedupe_ext_commit(true);
 		z_erofs_dedupe_commit(true);
@@ -1506,6 +1700,14 @@ int erofs_commit_compressed_file(struct z_erofs_compress_ictx *ictx,
 	}
 
 	inode->u.i_blocks = BLK_ROUND_UP(sbi, ptotal);
+	if (erofs_hotchunk_enabled()) {
+		ret = z_erofs_register_hot_pclusters(inode);
+		if (ret) {
+			erofs_err("failed to register compressed pclusters for %s: %s",
+				  inode->i_srcpath, erofs_strerror(ret));
+			return ret;
+		}
+	}
 	return 0;
 
 err_free_meta:
@@ -2086,6 +2288,12 @@ void *erofs_prepare_compressed_file(struct erofs_importer *im,
 			params->max_compressed_extent_size;
 		ictx->data_unaligned = false;
 	}
+	if (erofs_hotchunk_enabled()) {
+		if (params->max_compressed_extent_size ==
+		    EROFS_COMPRESSED_EXTENT_UNSPECIFIED)
+			ictx->max_compressed_extent_size = UINT32_MAX;
+		ictx->data_unaligned = false;
+	}
 	if (params->fragments && params->dedupe != EROFS_DEDUPE_FORCE_ON &&
 	    !ictx->data_unaligned && !erofs_inode_is_hotfile(inode))
 		inode->z_advise |= Z_EROFS_ADVISE_INTERLACED_PCLUSTER;
@@ -2507,6 +2715,8 @@ int z_erofs_compress_init(struct erofs_importer *im)
 int z_erofs_compress_exit(struct erofs_sb_info *sbi)
 {
 	int i, ret;
+
+	z_erofs_hot_pclusters_reset();
 
 	/* If `zmgr` is uninitialized, return directly. */
 	if (!sbi->zmgr)

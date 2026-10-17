@@ -27,6 +27,15 @@ struct erofs_hotfile_manifest {
 	struct erofs_hotfile_entry *dir_paths;
 	unsigned int nr_dirs;
 	unsigned int cap_dirs;
+	struct erofs_hotchunk_entry {
+		u32 device;
+		u64 inode;
+		u64 start;
+		u64 end;
+		unsigned int rank;
+	} *chunk_ranges;
+	unsigned int nr_chunk_ranges;
+	unsigned int cap_chunk_ranges;
 };
 
 static struct erofs_hotfile_manifest hotfile_manifest;
@@ -143,6 +152,19 @@ static int erofs_hotfile_path_cmp(const void *a, const void *b)
 	return strcmp(lhs, rhs->path);
 }
 
+static int erofs_hotchunk_cmp(const void *a, const void *b)
+{
+	const struct erofs_hotchunk_entry *lhs = a;
+	const struct erofs_hotchunk_entry *rhs = b;
+
+	if (lhs->device != rhs->device)
+		return lhs->device < rhs->device ? -1 : 1;
+	if (lhs->inode != rhs->inode)
+		return lhs->inode < rhs->inode ? -1 : 1;
+	if (lhs->rank < rhs->rank)
+		return -1;
+	return lhs->rank > rhs->rank;
+}
 
 static char *erofs_hotfile_normalize(const char *path)
 {
@@ -182,6 +204,39 @@ static char *erofs_hotfile_normalize(const char *path)
 static int erofs_hotfile_add_file(char *path, unsigned int rank);
 static int erofs_hotfile_add_dir(char *path, unsigned int rank);
 
+static int erofs_hotfile_add_chunk_range(const char *path, u64 start, u64 end,
+					 unsigned int rank)
+{
+	struct erofs_hotchunk_entry *ranges;
+	erofs_os_stat_t st;
+	char *fullpath;
+	int err;
+
+	if (hotfile_manifest.nr_chunk_ranges >= hotfile_manifest.cap_chunk_ranges) {
+		unsigned int cap = hotfile_manifest.cap_chunk_ranges ?
+			hotfile_manifest.cap_chunk_ranges * 2 : 64;
+
+		ranges = realloc(hotfile_manifest.chunk_ranges,
+				 cap * sizeof(*ranges));
+		if (!ranges)
+			return -ENOMEM;
+		hotfile_manifest.chunk_ranges = ranges;
+		hotfile_manifest.cap_chunk_ranges = cap;
+	}
+	if (asprintf(&fullpath, "%s/%s", cfg.c_src_path, path) < 0)
+		return -ENOMEM;
+	err = erofs_os_lstat(fullpath, &st);
+	free(fullpath);
+	if (err)
+		return -errno;
+	if (!S_ISREG(st.st_mode))
+		return -EINVAL;
+	ranges = hotfile_manifest.chunk_ranges;
+	ranges[hotfile_manifest.nr_chunk_ranges++] =
+		(struct erofs_hotchunk_entry){(u32)st.st_dev, st.st_ino,
+					start, end, rank};
+	return 0;
+}
 
 static int erofs_hotfile_add_file_path(const char *path, unsigned int rank)
 {
@@ -551,7 +606,8 @@ int erofs_hotfile_load(const char *path)
 		hotfile_dir_cache = calloc(EROFS_HOTFILE_DIR_CACHE_SIZE,
 					   sizeof(*hotfile_dir_cache));
 	while ((nread = getline(&line, &linesz, fp)) >= 0) {
-		char *input;
+		char *input, *offset_text, *length_text, *endptr;
+		u64 offset = 0, length = 0;
 
 		if (memchr(line, '\0', nread)) {
 			err = -EINVAL;
@@ -564,6 +620,35 @@ int erofs_hotfile_load(const char *path)
 		/* ./#name denotes a filename; only a literal leading # comments. */
 		if (!nread || line[0] == '#')
 			continue;
+		offset_text = strchr(line, '\t');
+		if (offset_text) {
+			*offset_text++ = '\0';
+			length_text = strchr(offset_text, '\t');
+			if (!length_text) {
+				err = -EINVAL;
+				break;
+			}
+			*length_text++ = '\0';
+			errno = 0;
+			offset = strtoull(offset_text, &endptr, 10);
+			if (errno || endptr == offset_text || !isdigit((unsigned char)*offset_text) || *endptr) {
+				err = -EINVAL;
+				break;
+			}
+			errno = 0;
+			length = strtoull(length_text, &endptr, 10);
+			while (*endptr && isspace((unsigned char)*endptr))
+				++endptr;
+			if (errno || endptr == length_text || !isdigit((unsigned char)*length_text) ||
+			    *endptr || !length || ULLONG_MAX - offset < length) {
+				err = -EINVAL;
+				break;
+			}
+		}
+		if (offset_text && !hotfile_root) {
+			err = -EOPNOTSUPP;
+			break;
+		}
 		input = strdup(line);
 		if (!input) {
 			err = -ENOMEM;
@@ -577,6 +662,15 @@ int erofs_hotfile_load(const char *path)
 		}
 		if (hotfile_root)
 			err = erofs_hotfile_add_resolved_path(input, hotfile_nr_input - 1);
+		if (!err && offset_text) {
+			char *resolved;
+
+			err = erofs_hotfile_resolve(input, 0, false, &resolved);
+			if (!err)
+				err = erofs_hotfile_add_chunk_range(resolved, offset,
+						offset + length, hotfile_nr_input - 1);
+			free(resolved);
+		}
 		if (err)
 			break;
 	}
@@ -590,6 +684,10 @@ int erofs_hotfile_load(const char *path)
 		return err;
 	}
 	erofs_hotfile_sort();
+	if (hotfile_manifest.nr_chunk_ranges)
+		qsort(hotfile_manifest.chunk_ranges,
+		      hotfile_manifest.nr_chunk_ranges,
+		      sizeof(*hotfile_manifest.chunk_ranges), erofs_hotchunk_cmp);
 	hotfile_prepared = hotfile_root != NULL;
 	erofs_info("loaded %u hot paths from %s", hotfile_nr_input, path);
 	return 0;
@@ -602,9 +700,56 @@ bool erofs_hotfile_enabled(void)
 		hotfile_nr_input != 0;
 }
 
+bool erofs_hotchunk_enabled(void)
+{
+	return hotfile_manifest.nr_chunk_ranges;
+}
 
+static unsigned int erofs_hotchunk_inode_start(u32 device, u64 inode)
+{
+	unsigned int left = 0, right = hotfile_manifest.nr_chunk_ranges;
 
+	while (left < right) {
+		unsigned int mid = left + (right - left) / 2;
+		struct erofs_hotchunk_entry *range =
+			&hotfile_manifest.chunk_ranges[mid];
 
+		if (range->device < device ||
+		    (range->device == device && range->inode < inode))
+			left = mid + 1;
+		else
+			right = mid;
+	}
+	return left;
+}
+
+bool erofs_hotfile_has_chunk_ranges(u32 device, u64 inode)
+{
+	unsigned int i = erofs_hotchunk_inode_start(device, inode);
+
+	return i < hotfile_manifest.nr_chunk_ranges &&
+		hotfile_manifest.chunk_ranges[i].device == device &&
+		hotfile_manifest.chunk_ranges[i].inode == inode;
+}
+
+unsigned int erofs_get_hot_chunk_rank(u32 device, u64 inode,
+				      u64 offset, u64 length)
+{
+	unsigned int rank = EROFS_HOT_RANK_NONE, i;
+
+	i = erofs_hotchunk_inode_start(device, inode);
+	for (; i < hotfile_manifest.nr_chunk_ranges &&
+	       hotfile_manifest.chunk_ranges[i].device == device &&
+	       hotfile_manifest.chunk_ranges[i].inode == inode; ++i) {
+		struct erofs_hotchunk_entry *range =
+			&hotfile_manifest.chunk_ranges[i];
+
+		if (offset < range->end && range->start < offset + length &&
+		    range->rank < rank)
+			rank = range->rank;
+	}
+	return rank;
+}
 
 unsigned int erofs_get_hot_file_rank(const char *path)
 {
@@ -930,6 +1075,8 @@ int erofs_hotfile_resolve_oci(struct erofs_inode *root)
 	unsigned int i, nr_raw, rank = hotfile_nr_input;
 	int err;
 
+	if (erofs_hotchunk_enabled())
+		return -EOPNOTSUPP;
 	hotfile_tree = root;
 	hotfile_oci = true;
 	err = erofs_hotfile_walk_tree(root, NULL, true);
@@ -1019,6 +1166,7 @@ void erofs_hotfile_exit(void)
 	for (i = 0; i < hotfile_manifest.nr_directories; ++i)
 		free(hotfile_manifest.directories[i].path);
 	free(hotfile_manifest.directories);
+	free(hotfile_manifest.chunk_ranges);
 	hotfile_manifest = (struct erofs_hotfile_manifest){};
 	for (i = 0; i < hotfile_nr_input; ++i)
 		free(hotfile_input[i].path);

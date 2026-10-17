@@ -1642,6 +1642,13 @@ static int erofs_mkfs_job_write_file(const struct erofs_mkfs_btctx *btctx,
 			goto out;
 		}
 	}
+	if (inode->sbi->available_compr_algs &&
+	    erofs_hotfile_has_chunk_ranges(inode->dev, inode->i_ino[1])) {
+		erofs_err("hot byte ranges require %s to remain compressed",
+			  inode->i_srcpath);
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 	/* fallback to all data uncompressed */
 	ret = erofs_write_unencoded_file(btctx->im, inode, ctx->fd, ctx->fpos);
 out:
