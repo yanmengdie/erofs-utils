@@ -988,6 +988,7 @@ out_eot:
 	tar->offset += st.st_size;
 	st.st_mode = 0;
 	switch(th->typeflag) {
+	case '\0':
 	case '0':
 	case '7':
 	case '1':
@@ -1052,10 +1053,9 @@ out_eot:
 		eh.link[st.st_size] = '\0';
 		goto restart;
 	default:
-		erofs_info("unrecognized typeflag %xh @ %llu - ignoring",
-			   th->typeflag, tar_offset);
-		(void)erofs_iostream_lskip(&tar->ios, st.st_size);
-		ret = 0;
+		erofs_err("unsupported typeflag %xh @ %llu",
+			  th->typeflag, tar_offset);
+		ret = -EOPNOTSUPP;
 		goto out;
 	}
 

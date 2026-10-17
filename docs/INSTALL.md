@@ -47,6 +47,16 @@ Depending on the selected configuration, the following binaries may be built:
 * `mount.erofs`
 * `erofsfuse`
 
+## Regression Tests
+
+After building on Linux, run `make check` to exercise hot-file layout,
+seekable and streamed TAR imports, compressed-image rebuilds, hot-data bounds,
+and reproducible output. The tests require Python 3.9 or later and LZ4 support.
+Configure with `--enable-oci` to include the OCI layer tests; their registry
+runs locally and does not require access to an external registry. Test images
+and extracted files are created in temporary directories, without mounting
+filesystems.
+
 ## Install
 
 ```sh
