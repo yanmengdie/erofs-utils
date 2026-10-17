@@ -139,6 +139,10 @@ unsigned int erofs_iput(struct erofs_inode *inode)
 	if (inode->datasource == EROFS_INODE_DATA_SOURCE_DISKBUF) {
 		erofs_diskbuf_close(inode->i_diskbuf);
 		free(inode->i_diskbuf);
+	} else if (inode->datasource == EROFS_INODE_DATA_SOURCE_TAR) {
+		/* The tar stream owns this fd and closes it after all import jobs. */
+		inode->i_link = NULL;
+		inode->datasource = EROFS_INODE_DATA_SOURCE_NONE;
 	} else if (inode->datasource == EROFS_INODE_DATA_SOURCE_REBUILD_BLOB) {
 		free(inode->rebuild_blobpath);
 	} else {
@@ -700,6 +704,45 @@ static int erofs_write_unencoded_data(struct erofs_inode *inode,
 	return 0;
 }
 
+/* Keep a separate read cursor for each borrowed TAR source. */
+static ssize_t erofs_read_tar_data(struct erofs_vfile *vf, void *buf, size_t len)
+{
+	struct erofs_vfile source = { .fd = vf->fd };
+	ssize_t ret;
+
+	if (!len)
+		return 0;
+	ret = erofs_io_pread(&source, buf, len, vf->offset);
+	if (ret < 0)
+		return ret;
+	/* A truncated source must fail rather than stall the xcopy loop at EOF. */
+	if (ret != len)
+		return -EIO;
+	vf->offset += ret;
+	return ret;
+}
+
+static ssize_t erofs_pread_tar_data(struct erofs_vfile *vf, void *buf,
+				     size_t len, u64 pos)
+{
+	struct erofs_vfile source = { .fd = vf->fd };
+	ssize_t ret;
+
+	if (!len)
+		return 0;
+	ret = erofs_io_pread(&source, buf, len, pos);
+	if (ret < 0)
+		return ret;
+	if (ret != len)
+		return -EIO;
+	return ret;
+}
+
+static struct erofs_vfops erofs_tar_data_ops = {
+	.read = erofs_read_tar_data,
+	.pread = erofs_pread_tar_data,
+};
+
 static int erofs_write_unencoded_file(const struct erofs_importer *im,
 				      struct erofs_inode *inode, int fd, u64 fpos)
 {
@@ -715,6 +758,13 @@ static int erofs_write_unencoded_file(const struct erofs_importer *im,
 		if (cfg.c_force_chunkformat == FORCE_INODE_CHUNK_INDEXES)
 			inode->u.chunkformat = EROFS_CHUNK_FORMAT_INDEXES;
 		return erofs_blob_write_chunked_file(inode, fd, fpos, device_id);
+	}
+
+	if (inode->datasource == EROFS_INODE_DATA_SOURCE_TAR) {
+		vf.ops = &erofs_tar_data_ops;
+		vf.offset = fpos;
+		inode->datalayout = EROFS_INODE_FLAT_INLINE;
+		return erofs_write_unencoded_data(inode, &vf, fpos, true, device_id);
 	}
 
 	if (inode->datasource == EROFS_INODE_DATA_SOURCE_REBUILD_BLOB) {
@@ -1585,7 +1635,8 @@ static int erofs_mkfs_job_write_file(const struct erofs_mkfs_btctx *btctx,
 		ret = erofs_write_compressed_file(ctx->ictx);
 		if (ret != EROFS_RETVAL_FALLBACK)
 			goto out;
-		if (erofs_os_lseek(ctx->fd, ctx->fpos, SEEK_SET) < 0) {
+		if (inode->datasource != EROFS_INODE_DATA_SOURCE_TAR &&
+		    erofs_os_lseek(ctx->fd, ctx->fpos, SEEK_SET) < 0) {
 			ret = -errno;
 			goto out;
 		}
@@ -1597,6 +1648,10 @@ out:
 		erofs_diskbuf_close(inode->i_diskbuf);
 		free(inode->i_diskbuf);
 		inode->i_diskbuf = NULL;
+		inode->datasource = EROFS_INODE_DATA_SOURCE_NONE;
+	} else if (inode->datasource == EROFS_INODE_DATA_SOURCE_TAR) {
+		/* The tar stream owns this fd and closes it after all import jobs. */
+		inode->i_link = NULL;
 		inode->datasource = EROFS_INODE_DATA_SOURCE_NONE;
 	} else if (inode->datasource == EROFS_INODE_DATA_SOURCE_REBUILD_BLOB) {
 		free(inode->rebuild_blobpath);
@@ -2093,6 +2148,8 @@ static int erofs_set_inode_fingerprint(struct erofs_inode *inode, int fd,
 
 	if (!ishare_xattr_prefix_id)
 		return 0;
+	if (inode->datasource == EROFS_INODE_DATA_SOURCE_TAR)
+		vf.ops = &erofs_tar_data_ops;
 	erofs_sha256_init(&md);
 	do {
 		u8 buf[32768];
@@ -2132,6 +2189,10 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 			if (ctx.fd < 0)
 				return ctx.fd;
 			break;
+		case EROFS_INODE_DATA_SOURCE_TAR:
+			ctx.fd = inode->tar_source.fd;
+			ctx.fpos = inode->tar_source.offset;
+			break;
 		case EROFS_INODE_DATA_SOURCE_LOCALPATH:
 			ctx.fd = erofs_os_open(inode->i_srcpath, O_RDONLY | O_BINARY);
 			if (ctx.fd < 0)
@@ -2160,8 +2221,19 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 				ret = PTR_ERR(ctx.ictx);
 				goto err_close;
 			}
-			erofs_bind_compressed_file_with_fd(ctx.ictx,
+			if (inode->datasource == EROFS_INODE_DATA_SOURCE_TAR) {
+				struct erofs_vfile vf = {
+					.fd = ctx.fd,
+					.offset = ctx.fpos,
+					.ops = &erofs_tar_data_ops,
+				};
+
+				erofs_bind_compressed_file_with_vfile(ctx.ictx, &vf,
+							      ctx.fpos);
+			} else {
+				erofs_bind_compressed_file_with_fd(ctx.ictx,
 							   ctx.fd, ctx.fpos);
+			}
 			ret = erofs_begin_compressed_file(ctx.ictx);
 			if (ret)
 				return ret;
@@ -2171,8 +2243,9 @@ out:
 	return erofs_mkfs_go(btctx, EROFS_MKFS_JOB_NDIR, &ctx, sizeof(ctx));
 
 err_close:
-	/* the diskbuf fd is shared and released along with the diskbuf */
-	if (inode->datasource != EROFS_INODE_DATA_SOURCE_DISKBUF)
+	/* Borrowed descriptors are released by their source owners. */
+	if (inode->datasource != EROFS_INODE_DATA_SOURCE_DISKBUF &&
+	    inode->datasource != EROFS_INODE_DATA_SOURCE_TAR)
 		close(ctx.fd);
 	return ret;
 }

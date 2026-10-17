@@ -6,6 +6,7 @@
 #include "erofs/config.h"
 #include "erofs/dedupe.h"
 #include "erofs/inode.h"
+#include "erofs/io.h"
 #include "erofs/print.h"
 #include "erofs/lock.h"
 #include "erofs/xattr.h"
@@ -48,6 +49,7 @@ int erofs_importer_init(struct erofs_importer *im)
 	const char *subsys = NULL;
 	int err;
 
+	im->tar_source = NULL;
 	erofs_importer_global_init();
 
 	subsys = "xattr";
@@ -151,4 +153,9 @@ void erofs_importer_exit(struct erofs_importer *im)
 	z_erofs_dedupe_ext_exit();
 	erofs_metadata_exit(sbi);
 	erofs_packedfile_exit(sbi);
+	if (im->tar_source) {
+		erofs_io_close(im->tar_source);
+		free(im->tar_source);
+		im->tar_source = NULL;
+	}
 }

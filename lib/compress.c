@@ -27,6 +27,7 @@
 #include "liberofs_fragments.h"
 #include "liberofs_metabox.h"
 #include "erofs/decompress.h"
+#include "liberofs_private.h"
 
 #define Z_EROFS_DESTBUF_SZ	(Z_EROFS_PCLUSTER_MAX_SIZE + EROFS_MAX_BLOCK_SIZE * 2)
 
@@ -1389,7 +1390,7 @@ int z_erofs_compress_segment(struct z_erofs_compress_sctx *ctx,
 			erofs_io_pread(vf, ctx->queue + ctx->tail, rx,
 				       ictx->fpos + offset));
 		if (ret != rx)
-			return -errno;
+			return ret < 0 ? ret : -EIO;
 
 		ctx->remaining -= rx;
 		ctx->tail += rx;
@@ -1863,7 +1864,7 @@ int erofs_mt_write_compressed_file(struct z_erofs_compress_ictx *ictx)
 	erofs_off_t pstart, ptotal = 0;
 	struct erofs_bufmgr *bmgr = ictx->device_id ?
 		sbi->devs[ictx->device_id - 1].bmgr : sbi->bmgr;
-	int ret;
+	int ret, err = 0;
 
 	bh = erofs_balloc(bmgr, DATA, 0, 0);
 	if (IS_ERR(bh)) {
@@ -1889,11 +1890,16 @@ int erofs_mt_write_compressed_file(struct z_erofs_compress_ictx *ictx)
 
 			cur->ctx.pstart = pstart;
 			ret2 = z_erofs_merge_segment(ictx, &cur->ctx);
-			if (ret2)
-				ret = ret2;
+			if (ret2 && !err)
+				err = ret2;
 
 			ptotal += cur->ctx.pstart - pstart;
 			pstart = cur->ctx.pstart;
+		} else {
+			if (!err)
+				err = ret;
+			free(cur->ctx.membuf);
+			cur->ctx.membuf = NULL;
 		}
 
 		pthread_mutex_lock(&z_erofs_mt_ctrl.mutex);
@@ -1902,10 +1908,15 @@ int erofs_mt_write_compressed_file(struct z_erofs_compress_ictx *ictx)
 		pthread_mutex_unlock(&z_erofs_mt_ctrl.mutex);
 	} while (head);
 
-	if (ret)
-		goto out;
+	if (err) {
+		ret = err;
+		goto err_drop_bh;
+	}
 	ret = erofs_commit_compressed_file(ictx, bh, pstart - ptotal, ptotal);
+	goto out;
 
+err_drop_bh:
+	erofs_bdrop(bh, true);
 out:
 	free(ictx);
 	return ret;
@@ -2093,6 +2104,15 @@ void erofs_bind_compressed_file_with_fd(struct z_erofs_compress_ictx *ictx,
 					int fd, u64 fpos)
 {
 	ictx->_vf = (struct erofs_vfile){ .fd = fd };
+	ictx->vf = &ictx->_vf;
+	ictx->fpos = fpos;
+}
+
+void erofs_bind_compressed_file_with_vfile(struct z_erofs_compress_ictx *ictx,
+					    const struct erofs_vfile *vf,
+					    u64 fpos)
+{
+	ictx->_vf = *vf;
 	ictx->vf = &ictx->_vf;
 	ictx->fpos = fpos;
 }

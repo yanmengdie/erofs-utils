@@ -446,6 +446,10 @@ directory.
 \fIMODE\fR may be one of \fBf\fR, \fBi\fR, or \fBheaderball\fR.
 
 \fBf\fR: Generate a full EROFS image from a regular tarball. (default)
+For uncompressed regular tar input and regular or compressed output, file data can be
+read directly from the open source at recorded offsets while retaining inode
+and hot-file ordering. The source contents must remain unchanged until mkfs
+finishes. Compressed input streams and chunk-based output use the staging path.
 
 \fBi\fR: Generate a meta-only EROFS image from a regular tarball. Only
 metadata such as dentries, inodes, and xattrs will be added to the image,
