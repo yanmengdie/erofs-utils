@@ -47,6 +47,11 @@ Depending on the selected configuration, the following binaries may be built:
 * `mount.erofs`
 * `erofsfuse`
 
+## Regression Tests
+
+Run `make check` on Linux after building. The regression fixtures require
+Python 3 and use temporary images without mounting filesystems.
+
 ## Install
 
 ```sh

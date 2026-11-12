@@ -563,7 +563,8 @@ int erofs_setxattr(struct erofs_inode *inode, int index,
 	memcpy(kvbuf, prefix->prefix, prefix->prefix_len);
 	memcpy(kvbuf + prefix->prefix_len, name,
 	       EROFS_XATTR_KSIZE(len) - prefix->prefix_len);
-	memcpy(kvbuf + EROFS_XATTR_KSIZE(len), value, size);
+	if (size)
+		memcpy(kvbuf + EROFS_XATTR_KSIZE(len), value, size);
 
 	item = get_xattritem(sbi, kvbuf, len);
 	if (IS_ERR(item)) {
