@@ -23,6 +23,7 @@
 #include "erofs/xattr.h"
 #include "erofs/exclude.h"
 #include "erofs/block_list.h"
+#include "erofs/hotfile.h"
 #include "erofs/compress_hints.h"
 #include "../lib/compressor.h"
 #include "../lib/liberofs_chunk.h"
@@ -105,8 +106,11 @@ static struct option long_options[] = {
 	{"MZ", optional_argument, NULL, 537},
 	{"xattr-prefix", required_argument, NULL, 538},
 	{"xattr-inode-digest", optional_argument, NULL, 539},
+	{"hot-file-list", required_argument, NULL, 540},
 	{0, 0, 0, 0},
 };
+
+static char *hotfile_list_path;
 
 static void print_available_compressors(FILE *f, const char *delim)
 {
@@ -210,6 +214,8 @@ static void usage(int argc, char **argv)
 		" --uid-offset=#         add offset # to all file uids (# = id offset)\n"
 		" --gid-offset=#         add offset # to all file gids (# = id offset)\n"
 		" --hard-dereference     dereference hardlinks, add links as separate inodes\n"
+		" --hot-file-list=X      specify newline-separated hot file paths for\n"
+		"                        local directory sources\n"
 		" --ignore-mtime         use build time instead of strict per-file modification time\n"
 		" --max-extent-bytes=#   set maximum decompressed extent size # in bytes\n"
 		" --mount-point=X        X=prefix of target fs path (default: /)\n"
@@ -1497,6 +1503,12 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 				return err;
 			}
 			break;
+		case 540:
+			free(hotfile_list_path);
+			hotfile_list_path = strdup(optarg);
+			if (!hotfile_list_path)
+				return -ENOMEM;
+			break;
 		case 'V':
 			version();
 			exit(0);
@@ -1550,6 +1562,11 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 					  tarerofs_decoder);
 		if (err)
 			return err;
+	}
+
+	if (hotfile_list_path && source_mode != EROFS_MKFS_SOURCE_LOCALDIR) {
+		erofs_err("--hot-file-list requires a local directory source");
+		return -EOPNOTSUPP;
 	}
 
 	if (quiet) {
@@ -1789,6 +1806,15 @@ int main(int argc, char **argv)
 		goto exit;
 	}
 
+	if (hotfile_list_path) {
+		err = erofs_hotfile_load(hotfile_list_path);
+		if (err) {
+			erofs_err("failed to load hot-file list %s: %s",
+				  hotfile_list_path, erofs_strerror(err));
+			goto exit;
+		}
+	}
+
 	err = parse_source_date_epoch();
 	if (err) {
 		fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
@@ -1909,6 +1935,12 @@ int main(int argc, char **argv)
 	err = erofs_importer_init(&importer);
 	if (err)
 		goto exit;
+
+	if (erofs_hotfile_enabled() && g_sbi.available_compr_algs) {
+		erofs_err("--hot-file-list requires uncompressed output");
+		err = -EOPNOTSUPP;
+		goto exit;
+	}
 
 	if (importer_params.dedupe == EROFS_DEDUPE_FORCE_ON &&
 	    g_sbi.available_compr_algs) {
@@ -2084,6 +2116,9 @@ exit:
 		fclose(blklst);
 	erofs_cleanup_compress_hints();
 	erofs_cleanup_exclude_rules();
+	erofs_hotfile_exit();
+	free(hotfile_list_path);
+	hotfile_list_path = NULL;
 	erofs_xattr_cleanup_name_prefixes();
 	erofs_rebuild_cleanup();
 	erofs_diskbuf_exit();

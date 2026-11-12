@@ -49,8 +49,9 @@ Depending on the selected configuration, the following binaries may be built:
 
 ## Regression Tests
 
-Run `make check` on Linux after building. The regression fixtures require
-Python 3 and use temporary images without mounting filesystems.
+Run `make check` on Linux after building. Python 3.9 or later is required.
+The tests check directory hot-file path resolution, physical layout,
+hardlink counts, and extracted contents.
 
 ## Install
 

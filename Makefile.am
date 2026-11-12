@@ -9,10 +9,14 @@ endif
 SUBDIRS += mount contrib
 
 TESTS = tests/xattr-empty.py \
-	tests/tar-links.py
+	tests/tar-links.py \
+	tests/hotfile-links.py \
+	tests/hotfile-inodes.py
 TESTS_ENVIRONMENT = MKFS='$(abs_builddir)/mkfs/mkfs.erofs' \
 	DUMP='$(abs_builddir)/dump/dump.erofs' \
 	FSCK='$(abs_builddir)/fsck/fsck.erofs'
 LOG_COMPILER = python3
 EXTRA_DIST = tests/xattr-empty.py \
-	tests/tar-links.py
+	tests/tar-links.py \
+	tests/hotfile-links.py \
+	tests/hotfile-inodes.py
