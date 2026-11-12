@@ -12,6 +12,7 @@ repo = Path(__file__).resolve().parents[1]
 mkfs = os.environ.get('MKFS', str(repo / 'mkfs/mkfs.erofs'))
 dump = os.environ.get('DUMP', str(repo / 'dump/dump.erofs'))
 fsck = os.environ.get('FSCK', str(repo / 'fsck/fsck.erofs'))
+has_lz4 = b'lz4' in subprocess.check_output([mkfs, '-V'])
 
 
 def run(*args):
@@ -49,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='erofs-inodes-') as tmp:
             os.setxattr(root, b'user.hotfile-boundary', b'x' * 256)
         sources = [('dir', root, [])]
         for kind, source, options in sources:
-            for compressed in [False]:
+            for compressed in ([False, True] if has_lz4 else [False]):
                 label = f'tail-{count}-{kind}-{compressed}'
                 image = build(label, source, options + (['-zlz4'] if compressed else []), 'hot\n')
                 assert max(end for _, end in extents(image, '/')) <= min(
@@ -112,6 +113,8 @@ with tempfile.TemporaryDirectory(prefix='erofs-inodes-') as tmp:
         order.append(name)
     random.Random(123).shuffle(order)
     layouts = [('plain', [])]
+    if has_lz4:
+        layouts.append(('grouped', ['-zlz4', '--zD']))
     for label, options in layouts:
         image = build('ranks-' + label, root, options, '\n'.join(order) + '\n')
         offsets = [min(start for start, _ in extents(image, '/' + name)) for name in order]
@@ -135,11 +138,3 @@ with tempfile.TemporaryDirectory(prefix='erofs-inodes-') as tmp:
     baseline = build('special-nohot', root, [], None)
     ignored = build('special-ignored', root, [], 'fifo\n')
     assert ignored.read_bytes() == baseline.read_bytes()
-
-    if b'lz4' in subprocess.check_output([mkfs, '-V']):
-        manifest = work / 'compressed.hot'
-        manifest.write_text('data\n')
-        result = subprocess.run([mkfs, '-zlz4', '--hot-file-list=' + str(manifest),
-                                 str(work / 'unsupported.erofs'), str(root)],
-                                capture_output=True, timeout=60)
-        assert result.returncode > 0 and b'requires uncompressed' in result.stderr

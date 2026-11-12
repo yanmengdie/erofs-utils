@@ -315,12 +315,13 @@ Read a newline-delimited list of image-relative hot file paths for local
 directory sources.
 Leading slashes refer to the image root.  Empty lines and lines starting with # are ignored; other spaces are
 part of the filename.  Use ./ to list a filename beginning with #.
-Hot regular files are scheduled in list order before cold files.
-Hardlink aliases share the earliest matching rank.
+Hot regular files are scheduled in list order before cold files while keeping
+compression enabled.  Hardlink aliases share the earliest matching rank.
 Symlinks are resolved within the image root, including intermediate components.
 Parent directories are also prioritized.  Entries ending in \fI/\fR prioritize
 the directory without recursively marking its children hot.
-This option currently requires uncompressed builds.
+Hot files bypass compressed fragment packing, compressed tail inlining and
+compressed extent deduplication.
 Chunk-based images retain chunk sharing; hot scheduling does not guarantee
 separate physical extents for each hot file.
 This is file-level data ordering: directory compression, metadata zones and
