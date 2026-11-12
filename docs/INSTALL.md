@@ -50,10 +50,11 @@ Depending on the selected configuration, the following binaries may be built:
 ## Regression Tests
 
 Run `make check` on Linux after building. Python 3.9 or later is required.
-The tests check directory hot-file path resolution, physical layout,
-hardlink counts, and extracted contents.
-LZ4 enables the compression, fragment and dedupe cases.
-Full TAR imports are checked against the final imported tree.
+The tests check hot-file path resolution, physical layout, hardlink counts,
+and extracted contents. LZ4 enables the compression, fragment and dedupe
+cases. Configure with `--enable-oci` to test OCI imports against a local
+registry fixture; no external registry is needed. Its gzip cases are skipped
+when zlib is unavailable.
 
 ## Install
 

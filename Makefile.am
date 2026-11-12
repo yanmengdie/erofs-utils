@@ -19,8 +19,12 @@ LOG_COMPILER = python3
 if ENABLE_LZ4
 TESTS += tests/hotfile-compression.py
 endif
+if ENABLE_OCI
+TESTS += tests/hotfile-oci.py
+endif
 EXTRA_DIST = tests/xattr-empty.py \
 	tests/tar-links.py \
 	tests/hotfile-links.py \
 	tests/hotfile-inodes.py \
-	tests/hotfile-compression.py
+	tests/hotfile-compression.py \
+	tests/hotfile-oci.py

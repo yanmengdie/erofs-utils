@@ -312,13 +312,13 @@ Dereference hardlinks and add links as separate inodes.
 .TP
 .BI "\-\-hot-file-list=" path
 Read a newline-delimited list of image-relative hot file paths for local
-directory or tar full sources.
+directory, tar full, or OCI full sources.
 Leading slashes refer to the image root.  Empty lines and lines starting with # are ignored; other spaces are
 part of the filename.  Use ./ to list a filename beginning with #.
 Hot regular files are scheduled in list order before cold files while keeping
 compression enabled.  Hardlink aliases share the earliest matching rank.
 Symlinks are resolved within the image root, including intermediate components;
-for tar sources, matching uses the final imported tree.
+for tar and OCI sources, matching uses the final imported tree.
 Parent directories are also prioritized.  Entries ending in \fI/\fR prioritize
 the directory without recursively marking its children hot.
 Hot files bypass compressed fragment packing, compressed tail inlining and

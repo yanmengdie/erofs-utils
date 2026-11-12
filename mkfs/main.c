@@ -215,7 +215,7 @@ static void usage(int argc, char **argv)
 		" --gid-offset=#         add offset # to all file gids (# = id offset)\n"
 		" --hard-dereference     dereference hardlinks, add links as separate inodes\n"
 		" --hot-file-list=X      specify newline-separated hot file paths for\n"
-		"                        local directory or tar full sources\n"
+		"                        local directory, tar full, or OCI full sources\n"
 		" --ignore-mtime         use build time instead of strict per-file modification time\n"
 		" --max-extent-bytes=#   set maximum decompressed extent size # in bytes\n"
 		" --mount-point=X        X=prefix of target fs path (default: /)\n"
@@ -339,6 +339,10 @@ static bool mkfs_hotfile_supported_source(void)
 		return true;
 	case EROFS_MKFS_SOURCE_TAR:
 		return !erofstar.index_mode &&
+		       dataimport_mode != EROFS_MKFS_DATA_IMPORT_RVSP &&
+		       dataimport_mode != EROFS_MKFS_DATA_IMPORT_ZEROFILL;
+	case EROFS_MKFS_SOURCE_OCI:
+		return !mkfs_oci_tarindex_mode &&
 		       dataimport_mode != EROFS_MKFS_DATA_IMPORT_RVSP &&
 		       dataimport_mode != EROFS_MKFS_DATA_IMPORT_ZEROFILL;
 	default:
@@ -1584,7 +1588,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		return -EINVAL;
 	}
 	if (hotfile_list_path && !mkfs_hotfile_supported_source()) {
-		erofs_err("--hot-file-list is only supported for local directories and tar full mode");
+		erofs_err("--hot-file-list is only supported for local directories, tar full mode, and OCI full mode");
 		return -EOPNOTSUPP;
 	}
 
@@ -2081,7 +2085,9 @@ int main(int argc, char **argv)
 	if (err < 0)
 		goto exit;
 
-	if (hotfile_list_path && source_mode == EROFS_MKFS_SOURCE_TAR) {
+	if (hotfile_list_path &&
+	    (source_mode == EROFS_MKFS_SOURCE_TAR ||
+	     source_mode == EROFS_MKFS_SOURCE_OCI)) {
 		err = erofs_hotfile_prepare_tree(root);
 		if (err)
 			goto exit;
