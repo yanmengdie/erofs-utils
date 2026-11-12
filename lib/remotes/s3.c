@@ -1159,7 +1159,7 @@ int s3erofs_build_trees(struct erofs_importer *im, struct erofs_s3 *s3,
 		}
 
 		d = erofs_rebuild_get_dentry(root, obj->key, false,
-					     &dumb, &dumb, false);
+					     &dumb, &dumb, false, NULL);
 		if (IS_ERR(d)) {
 			ret = PTR_ERR(d);
 			goto err_iter;

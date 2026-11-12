@@ -10,8 +10,10 @@ enum erofs_rebuild_datamode {
 	EROFS_REBUILD_DATA_FULL,
 };
 
+/* @parent optionally receives the borrowed containing inode of the dentry. */
 struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
-		char *path, bool aufs, bool *whout, bool *opq, bool to_head);
+		char *path, bool aufs, bool *whout, bool *opq, bool to_head,
+		struct erofs_inode **parent);
 
 int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
 			    enum erofs_rebuild_datamode mode);
