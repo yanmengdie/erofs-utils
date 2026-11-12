@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import re
 import subprocess
+import tarfile
 import tempfile
 
 repo = Path(__file__).resolve().parents[1]
@@ -49,6 +50,11 @@ with tempfile.TemporaryDirectory(prefix='erofs-inodes-') as tmp:
         if xattr:
             os.setxattr(root, b'user.hotfile-boundary', b'x' * 256)
         sources = [('dir', root, [])]
+        if not xattr:
+            archive = work / 'root.tar'
+            with tarfile.open(archive, 'w') as stream:
+                stream.add(root, arcname='.')
+            sources.append(('tar', archive, ['--tar=f']))
         for kind, source, options in sources:
             for compressed in ([False, True] if has_lz4 else [False]):
                 label = f'tail-{count}-{kind}-{compressed}'
@@ -84,7 +90,10 @@ with tempfile.TemporaryDirectory(prefix='erofs-inodes-') as tmp:
     for name in ['real/hot', 'real/cold'] + [f'a-cold-{i:03}' for i in range(24)]:
         (root / name).write_bytes(payload)
     (root / 'z-alias').symlink_to('real')
-    for kind, source, options in [('dir', root, [])]:
+    archive = work / 'alias.tar'
+    with tarfile.open(archive, 'w') as stream:
+        stream.add(root, arcname='.')
+    for kind, source, options in [('dir', root, []), ('tar', archive, ['--tar=f'])]:
         for rank, hot in enumerate(['real\n', 'real/\n', 'real/hot\n']):
             image = build(f'alias-{kind}-{rank}', source, options, hot)
             nids = {name: int(re.search(r'NID:\s*(\d+)',

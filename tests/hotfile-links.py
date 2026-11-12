@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: GPL-2.0+ OR MIT
 """Hot paths resolve inside the image and preserve links and file contents."""
 import hashlib
+import io
 import os
 from pathlib import Path
 import re
 import subprocess
+import tarfile
 import tempfile
 
 
@@ -43,28 +45,40 @@ def main(out):
         case.mkdir(exist_ok=True)
         root = case / 'root'
         root.mkdir(exist_ok=True)
+        archive = case / 'root.tar'
         expected = {}
-        for path, kind, value in entries:
-            dest = root / path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists() or dest.is_symlink():
-                dest.unlink()
-            if kind == 'f':
-                payload = value.encode() * 65536
-                dest.write_bytes(payload)
-                expected[path] = ('f', hashlib.sha256(payload).hexdigest())
-            elif kind == 'h':
-                os.link(root / value, dest)
-                expected[path] = expected[value]
-            else:
-                dest.symlink_to(value)
-                expected[path] = ('s', value)
+        with tarfile.open(archive, 'w', format=tarfile.PAX_FORMAT) as tf:
+            for path, kind, value in entries:
+                dest = root / path
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                ti = tarfile.TarInfo('./' + path)
+                ti.mode = 0o644
+                if kind == 'f':
+                    payload = value.encode() * 65536
+                    dest.write_bytes(payload)
+                    expected[path] = ('f', hashlib.sha256(payload).hexdigest())
+                    ti.size = len(payload)
+                    tf.addfile(ti, io.BytesIO(payload))
+                elif kind == 'h':
+                    os.link(root / value, dest)
+                    expected[path] = expected[value]
+                    ti.type, ti.linkname = tarfile.LNKTYPE, './' + value
+                    tf.addfile(ti)
+                else:
+                    dest.symlink_to(value)
+                    expected[path] = ('s', value)
+                    ti.type, ti.linkname = tarfile.SYMTYPE, value
+                    tf.addfile(ti)
         manifest = case / 'hot.txt'
         manifest.write_text(hot)
-        for mode in ('dir',):
+        for mode in ('dir', 'tar'):
             image = case / (mode + '.erofs')
             cmd = [mkfs, '-T0', '-U00000000-0000-0000-0000-000000000000', '--hot-file-list=' + str(manifest)]
-            p = run(cmd + [image, root])
+            if mode == 'tar':
+                cmd += ['--tar=f']
+            p = run(cmd + [image, root if mode == 'dir' else archive])
             row = {'case': name, 'mode': mode, 'rc': p.returncode}
             if target is None:
                 check(p.returncode != 0, row)
@@ -96,9 +110,11 @@ def main(out):
                 check(len({offsets[x] for x in ('z-target', 'b-alias', 'sub/hot')}) == 1, (row, offsets))
     # Empty/invalid candidates must not enable hot metadata reservations.
     case = out / 'relative'
-    for mode in ('dir',):
-        source = case / 'root'
+    for mode in ('dir', 'tar'):
+        source = case / ('root' if mode == 'dir' else 'root.tar')
         cmd = [mkfs, '-T0', '-U00000000-0000-0000-0000-000000000000']
+        if mode == 'tar':
+            cmd += ['--tar=f']
         reference = case / (mode + '-nohot.erofs')
         check(run(cmd + [reference, source]).returncode == 0, 'no-hot baseline')
         for label, content in (('empty', b''), ('comments', b'# only comment\n'),
@@ -113,6 +129,23 @@ def main(out):
             else:
                 check(p.returncode == 0, (mode, label, p.stderr))
                 check(image.read_bytes() == reference.read_bytes(), (mode, label, 'no-op changed image'))
+    # Explicit conflicting sort requests must fail independent of option order.
+    case = out / 'relative'
+    manifest = case / 'sort-hot.txt'
+    manifest.write_text('z-target\n')
+    common = [mkfs, '--tar=f', '-Enoinline_data']
+    for compression in ([], ['-zlz4']):
+        for reverse in (False, True):
+            options = ['--sort=none', '--hot-file-list=' + str(manifest)]
+            if reverse:
+                options.reverse()
+            p = run(common + compression + options + [case / 'conflict.erofs', case / 'root.tar'])
+            check(p.returncode != 0 and b'conflicts with --sort=none' in p.stderr,
+                  ('sort conflict', compression, reverse, p.stderr))
+    p = run(common + ['--sort=none', case / 'unsorted.erofs', case / 'root.tar'])
+    check(p.returncode == 0, ('no-hot unsorted', p.stderr))
+    check(run([fsck, '--extract', case / 'unsorted.erofs']).returncode == 0,
+          'no-hot unsorted fsck')
     print('PASS hot-path resolution and layout')
 
 

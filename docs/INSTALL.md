@@ -53,6 +53,7 @@ Run `make check` on Linux after building. Python 3.9 or later is required.
 The tests check directory hot-file path resolution, physical layout,
 hardlink counts, and extracted contents.
 LZ4 enables the compression, fragment and dedupe cases.
+Full TAR imports are checked against the final imported tree.
 
 ## Install
 

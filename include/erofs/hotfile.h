@@ -12,7 +12,10 @@ extern "C"
 
 #define EROFS_HOT_RANK_NONE	UINT_MAX
 
-int erofs_hotfile_load(const char *path);
+int erofs_hotfile_load(const char *path, const char *root);
+struct erofs_inode;
+/* Resolve and consume deferred input once, after the final tree is built. */
+int erofs_hotfile_prepare_tree(struct erofs_inode *root);
 unsigned int erofs_get_hot_symlink_rank(const char *path);
 bool erofs_hotfile_enabled(void);
 unsigned int erofs_get_hot_file_rank(const char *path);
