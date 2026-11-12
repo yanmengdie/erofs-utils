@@ -9,7 +9,10 @@ extern "C"
 
 #include "defs.h"
 
-int erofs_hotfile_load(const char *path);
+struct erofs_inode;
+
+int erofs_hotfile_load(const char *path, const char *root);
+int erofs_hotfile_prepare_tree(struct erofs_inode *root);
 void erofs_hotfile_exit(void);
 bool erofs_hotfile_enabled(void);
 

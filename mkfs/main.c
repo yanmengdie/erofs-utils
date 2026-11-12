@@ -215,7 +215,7 @@ static void usage(int argc, char **argv)
 		" --gid-offset=#         add offset # to all file gids (# = id offset)\n"
 		" --hard-dereference     dereference hardlinks, add links as separate inodes\n"
 		" --hot-file-list=X      specify newline-separated hot file paths for\n"
-		"                        local directory sources\n"
+		"                        local directory or tar full sources\n"
 		" --ignore-mtime         use build time instead of strict per-file modification time\n"
 		" --max-extent-bytes=#   set maximum decompressed extent size # in bytes\n"
 		" --mount-point=X        X=prefix of target fs path (default: /)\n"
@@ -331,6 +331,20 @@ static enum {
 	EROFS_MKFS_SOURCE_OCI,
 	EROFS_MKFS_SOURCE_REBUILD,
 } source_mode;
+
+static bool mkfs_hotfile_supported_source(void)
+{
+	switch (source_mode) {
+	case EROFS_MKFS_SOURCE_LOCALDIR:
+		return true;
+	case EROFS_MKFS_SOURCE_TAR:
+		return !erofstar.index_mode &&
+		       dataimport_mode != EROFS_MKFS_DATA_IMPORT_RVSP &&
+		       dataimport_mode != EROFS_MKFS_DATA_IMPORT_ZEROFILL;
+	default:
+		return false;
+	}
+}
 
 static unsigned int rebuild_src_count;
 static LIST_HEAD(rebuild_src_list);
@@ -1568,8 +1582,13 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		erofs_err("--hot-file-list conflicts with --incremental");
 		return -EINVAL;
 	}
-	if (hotfile_list_path && source_mode != EROFS_MKFS_SOURCE_LOCALDIR) {
-		erofs_err("--hot-file-list requires a local directory source");
+	if (hotfile_list_path && source_mode == EROFS_MKFS_SOURCE_TAR &&
+	    erofstar.try_no_reorder) {
+		erofs_err("--hot-file-list conflicts with --sort=none");
+		return -EINVAL;
+	}
+	if (hotfile_list_path && !mkfs_hotfile_supported_source()) {
+		erofs_err("--hot-file-list is only supported for local directories and tar full mode");
 		return -EOPNOTSUPP;
 	}
 
@@ -1811,7 +1830,9 @@ int main(int argc, char **argv)
 	}
 
 	if (hotfile_list_path) {
-		err = erofs_hotfile_load(hotfile_list_path);
+		err = erofs_hotfile_load(hotfile_list_path,
+				source_mode == EROFS_MKFS_SOURCE_LOCALDIR ?
+				cfg.c_src_path : NULL);
 		if (err) {
 			erofs_err("failed to load hot-file list %s: %s",
 				  hotfile_list_path, erofs_strerror(err));
@@ -2065,6 +2086,11 @@ int main(int argc, char **argv)
 	if (err < 0)
 		goto exit;
 
+	if (hotfile_list_path && source_mode == EROFS_MKFS_SOURCE_TAR) {
+		err = erofs_hotfile_prepare_tree(root);
+		if (err)
+			goto exit;
+	}
 	err = erofs_importer_load_tree(&importer,
 				       source_mode != EROFS_MKFS_SOURCE_LOCALDIR,
 				       incremental_mode);

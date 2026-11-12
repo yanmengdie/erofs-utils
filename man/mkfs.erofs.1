@@ -312,7 +312,7 @@ Dereference hardlinks and add links as separate inodes.
 .TP
 .BI "\-\-hot-file-list=" path
 Read a newline-delimited list of image-relative hot file paths for local
-directory sources.
+directory or tar full sources.
 Leading slashes refer to the image root.  Empty lines and lines starting
 with # are ignored; other spaces are part of the filename.  Use ./ to list
 a filename beginning with #.
@@ -320,7 +320,8 @@ Hot regular files are scheduled in list order before cold files while keeping
 compression enabled.  Unlisted files retain their relative traversal order.
 Hardlink aliases share the earliest matching rank.
 Symlinks, including intermediate ones, are resolved within the image root
-and are prioritized together with their targets.
+and are prioritized together with their targets; for tar sources, matching
+uses the final imported tree.
 Parent directories are also prioritized.  Entries ending in \fI/\fR prioritize
 the directory without recursively marking its children hot.
 Hot files are never packed into fragments, since that would move their
@@ -331,6 +332,7 @@ This is file-level data ordering: directory compression, metadata zones and
 metadata allocation can place metadata elsewhere in the image, so a complete,
 independently usable hot prefix is not guaranteed.
 This option cannot be combined with \fB--incremental\fR.
+This option cannot be combined with \fB--sort=none\fR for tar input.
 .TP
 .B "\-\-ignore-mtime"
 Ignore the file modification time whenever it would cause \fBmkfs.erofs\fR to
