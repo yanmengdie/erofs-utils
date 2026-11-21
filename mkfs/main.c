@@ -1940,12 +1940,6 @@ int main(int argc, char **argv)
 	if (err)
 		goto exit;
 
-	if (erofs_hotfile_enabled() && g_sbi.available_compr_algs) {
-		erofs_err("--hot-file-list requires uncompressed output");
-		err = -EOPNOTSUPP;
-		goto exit;
-	}
-
 	if (importer_params.dedupe == EROFS_DEDUPE_FORCE_ON &&
 	    g_sbi.available_compr_algs) {
 		err = z_erofs_dedupe_init(erofs_blksiz(&g_sbi));

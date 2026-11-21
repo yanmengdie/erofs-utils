@@ -316,13 +316,15 @@ directory sources.
 Leading slashes refer to the image root.  Empty lines and lines starting
 with # are ignored; other spaces are part of the filename.  Use ./ to list
 a filename beginning with #.
-Hot regular files are scheduled in list order before cold files.
-Unlisted files retain their relative traversal order.
+Hot regular files are scheduled in list order before cold files while keeping
+compression enabled.  Unlisted files retain their relative traversal order.
 Hardlink aliases share the earliest matching rank.
-Symlinks are resolved within the image root, including intermediate components.
+Symlinks, including intermediate ones, are resolved within the image root
+and are prioritized together with their targets.
 Parent directories are also prioritized.  Entries ending in \fI/\fR prioritize
 the directory without recursively marking its children hot.
-This option currently requires uncompressed builds.
+Hot files are never packed into fragments, since that would move their
+tails out of the hot area.
 Data deduplication and chunk sharing are kept, so hot files may still
 share physical extents with other files.
 This is file-level data ordering: directory compression, metadata zones and
