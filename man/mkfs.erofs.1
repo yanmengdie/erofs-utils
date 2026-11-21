@@ -310,6 +310,26 @@ random gzip access. Source file must be a gzip-compressed tarball.
 .BI "\-\-hard-dereference"
 Dereference hardlinks and add links as separate inodes.
 .TP
+.BI "\-\-hot-file-list=" path
+Read a newline-delimited list of image-relative hot file paths for local
+directory sources.
+Leading slashes refer to the image root.  Empty lines and lines starting
+with # are ignored; other spaces are part of the filename.  Use ./ to list
+a filename beginning with #.
+Hot regular files are scheduled in list order before cold files.
+Unlisted files retain their relative traversal order.
+Hardlink aliases share the earliest matching rank.
+Symlinks are resolved within the image root, including intermediate components.
+Parent directories are also prioritized.  Entries ending in \fI/\fR prioritize
+the directory without recursively marking its children hot.
+This option currently requires uncompressed builds.
+Data deduplication and chunk sharing are kept, so hot files may still
+share physical extents with other files.
+This is file-level data ordering: directory compression, metadata zones and
+metadata allocation can place metadata elsewhere in the image, so a complete,
+independently usable hot prefix is not guaranteed.
+This option cannot be combined with \fB--incremental\fR.
+.TP
 .B "\-\-ignore-mtime"
 Ignore the file modification time whenever it would cause \fBmkfs.erofs\fR to
 use extended inodes over compact inodes. When not using a fixed timestamp, this

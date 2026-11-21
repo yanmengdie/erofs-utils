@@ -272,6 +272,8 @@ struct erofs_inode {
 	/* OVL: non-merge dir that may contain whiteout entries */
 	bool whiteouts;
 	bool dot_omitted;
+	/* position in --hot-file-list, or EROFS_HOT_RANK_NONE if not hot */
+	unsigned int hot_rank;
 
 	unsigned int xattr_isize;
 	unsigned int extent_isize;
@@ -357,6 +359,7 @@ static inline struct erofs_inode *erofs_parent_inode(struct erofs_inode *inode)
 
 #define EROFS_DENTRY_FLAG_VALIDNID	0x01
 #define EROFS_DENTRY_FLAG_FIXUP_PNID	0x02
+#define EROFS_DENTRY_FLAG_NLINK_COUNTED	0x04
 struct erofs_dentry {
 	struct list_head d_child;	/* child of parent list */
 	union {
@@ -566,6 +569,14 @@ static inline bool erofs_is_packed_inode(struct erofs_inode *inode)
 	return erofs_sb_has_fragments(inode->sbi) &&
 		inode->sbi->packed_nid > 0 &&
 		inode->nid == inode->sbi->packed_nid;
+}
+
+#define EROFS_HOT_RANK_NONE	UINT_MAX
+
+static inline bool erofs_inode_is_hotfile(struct erofs_inode *inode)
+{
+	return !S_ISDIR(inode->i_mode) &&
+		inode->hot_rank != EROFS_HOT_RANK_NONE;
 }
 
 int erofs_packedfile_init(struct erofs_sb_info *sbi, bool fragments_mkfs);

@@ -23,6 +23,7 @@
 #include "erofs/exclude.h"
 #include "erofs/block_list.h"
 #include "erofs/compress_hints.h"
+#include "erofs/hotfile.h"
 #include "erofs/importer.h"
 #include "liberofs_cache.h"
 #include "liberofs_chunk.h"
@@ -654,13 +655,16 @@ static int erofs_write_unencoded_data(struct erofs_inode *inode,
 	inode->idata_size = inode->i_size % erofs_blksiz(sbi);
 	remaining = inode->i_size - inode->idata_size;
 
-	ret = erofs_allocate_inode_bh_data(inode, remaining >> sbi->blkszbits,
-					   device_id);
-	if (ret)
-		return ret;
+	/* Reuse data reserved while scheduling a hot directory. */
+	if (!inode->bh_data) {
+		ret = erofs_allocate_inode_bh_data(inode,
+				remaining >> sbi->blkszbits, device_id);
+		if (ret)
+			return ret;
+	}
 
 	bh = inode->bh_data;
-	if (bh) {
+	if (bh && remaining) {
 		bmgr = (struct erofs_bufmgr *)bh->block->buffers.fsprivate;
 		pos = erofs_btell(bh, false);
 		if (__erofs_unlikely(pos == EROFS_NULL_ADDR))
@@ -1371,6 +1375,9 @@ static int erofs_fill_inode(struct erofs_importer *im, struct erofs_inode *inode
 		if (!inode->i_srcpath)
 			return -ENOMEM;
 	}
+	if (!erofs_is_special_identifier(path))
+		inode->hot_rank = erofs_hotfile_rank(path,
+						     S_ISDIR(inode->i_mode));
 
 	if (erofs_should_use_inode_extended(im, inode, path)) {
 		if (params->force_inodeversion == EROFS_FORCE_INODE_COMPACT) {
@@ -1406,6 +1413,7 @@ struct erofs_inode *erofs_new_inode(struct erofs_sb_info *sbi)
 	inode->i_count = 1;
 	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 	inode->nid = EROFS_NID_UNALLOCATED;
+	inode->hot_rank = EROFS_HOT_RANK_NONE;
 
 	init_list_head(&inode->i_hash);
 	init_list_head(&inode->i_subdirs);
@@ -1433,8 +1441,12 @@ static struct erofs_inode *erofs_iget_from_local(struct erofs_importer *im,
 	 */
 	if (!S_ISDIR(st.st_mode) && !params->hard_dereference) {
 		inode = erofs_iget(st.st_dev, st.st_ino);
-		if (inode)
+		if (inode) {
+			/* take the earliest rank among all hardlinks */
+			inode->hot_rank = min(inode->hot_rank,
+					      erofs_hotfile_rank(path, false));
 			return inode;
+		}
 	}
 
 	/* cannot find in the inode cache */
@@ -1635,6 +1647,28 @@ static int erofs_mkfs_create_directory(const struct erofs_mkfs_btctx *ctx,
 	if (ret)
 		return ret;
 	inode->bh->op = &erofs_skip_write_bhops;
+
+	/*
+	 * Reserve data blocks for hot directories now, before hot files
+	 * advance the allocator.  Non-inline tails get their block here too
+	 * since they cannot be ballooned into place later.
+	 */
+	if (inode->hot_rank != EROFS_HOT_RANK_NONE &&
+	    (inode->datalayout == EROFS_INODE_FLAT_INLINE ||
+	     inode->datalayout == EROFS_INODE_FLAT_PLAIN)) {
+		erofs_blk_t nblocks = inode->i_size >> inode->sbi->blkszbits;
+
+		if (inode->datalayout == EROFS_INODE_FLAT_PLAIN &&
+		    inode->idata_size)
+			++nblocks;
+		if (!nblocks)
+			return 0;
+		ret = erofs_allocate_inode_bh_data(inode, nblocks,
+				ctx->im->params->dirdata_in_metazone ? -1 : 0);
+		if (ret)
+			return ret;
+		inode->lazy_tailblock = false;
+	}
 	return 0;
 }
 
@@ -2166,6 +2200,143 @@ static void erofs_mark_parent_inode(struct erofs_inode *inode,
 	inode->i_parent = (void *)((uintptr_t)dir | 1);
 }
 
+/*
+ * Hot inodes are dumped before the regular traversal.  Directories and
+ * symlinks come first so that hot metadata and dirent blocks are allocated
+ * up front, then regular files follow in --hot-file-list order.  Ties are
+ * broken by enqueue order to keep the result deterministic.
+ */
+struct erofs_mkfs_hot_item {
+	struct erofs_inode *dir;
+	struct erofs_dentry *d;
+	bool regular;
+	unsigned int rank;
+	u64 seq;
+};
+
+struct erofs_mkfs_hot_queue {
+	struct erofs_mkfs_hot_item *items;
+	size_t nr, cap;
+	u64 seq;
+};
+
+static bool erofs_mkfs_hot_before(const struct erofs_mkfs_hot_item *a,
+				  const struct erofs_mkfs_hot_item *b)
+{
+	if (a->regular != b->regular)
+		return !a->regular;
+	if (a->rank != b->rank)
+		return a->rank < b->rank;
+	return a->seq < b->seq;
+}
+
+static int erofs_mkfs_hot_push(struct erofs_mkfs_hot_queue *q,
+			       struct erofs_inode *dir, struct erofs_dentry *d)
+{
+	struct erofs_mkfs_hot_item item = {
+		.dir = dir,
+		.d = d,
+		.regular = !S_ISDIR(d->inode->i_mode) &&
+			   !S_ISLNK(d->inode->i_mode),
+		.rank = d->inode->hot_rank,
+		.seq = q->seq++,
+	};
+	size_t i, parent;
+
+	if (q->nr >= q->cap) {
+		size_t cap;
+		void *items;
+
+		if (q->cap > SIZE_MAX / 2 / sizeof(*q->items))
+			return -ENOMEM;
+		cap = q->cap ? q->cap << 1 : 64;
+		items = realloc(q->items, cap * sizeof(*q->items));
+		if (!items)
+			return -ENOMEM;
+		q->items = items;
+		q->cap = cap;
+	}
+
+	for (i = q->nr++; i; i = parent) {
+		parent = (i - 1) / 2;
+		if (!erofs_mkfs_hot_before(&item, &q->items[parent]))
+			break;
+		q->items[i] = q->items[parent];
+	}
+	q->items[i] = item;
+	return 0;
+}
+
+static struct erofs_mkfs_hot_item
+erofs_mkfs_hot_pop(struct erofs_mkfs_hot_queue *q)
+{
+	struct erofs_mkfs_hot_item top = q->items[0];
+	struct erofs_mkfs_hot_item last = q->items[--q->nr];
+	size_t i = 0, child;
+
+	while ((child = 2 * i + 1) < q->nr) {
+		if (child + 1 < q->nr &&
+		    erofs_mkfs_hot_before(&q->items[child + 1],
+					  &q->items[child]))
+			++child;
+		if (!erofs_mkfs_hot_before(&q->items[child], &last))
+			break;
+		q->items[i] = q->items[child];
+		i = child;
+	}
+	if (q->nr)
+		q->items[i] = last;
+	return top;
+}
+
+static int erofs_mkfs_hot_push_children(struct erofs_mkfs_hot_queue *q,
+					struct erofs_inode *dir)
+{
+	struct erofs_dentry *d;
+	int err;
+
+	list_for_each_entry(d, &dir->i_subdirs, d_child) {
+		if (is_dot_dotdot(d->name) ||
+		    (d->flags & EROFS_DENTRY_FLAG_VALIDNID) ||
+		    d->inode->hot_rank == EROFS_HOT_RANK_NONE)
+			continue;
+		err = erofs_mkfs_hot_push(q, dir, d);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int erofs_mkfs_dump_hot_tree(const struct erofs_mkfs_btctx *ctx)
+{
+	struct erofs_mkfs_hot_queue q = {};
+	int err;
+
+	err = erofs_mkfs_hot_push_children(&q, ctx->im->root);
+	while (!err && q.nr) {
+		struct erofs_mkfs_hot_item item = erofs_mkfs_hot_pop(&q);
+		struct erofs_inode *inode = item.d->inode;
+
+		if (erofs_inode_visited(inode))
+			continue;
+		erofs_mark_parent_inode(inode, item.dir);
+		err = erofs_mkfs_handle_inode(ctx, inode);
+		if (err)
+			break;
+
+		/*
+		 * The cold entries of hot directories are dumped later in the
+		 * regular traversal; i_nlink already covers this first name.
+		 */
+		if (S_ISDIR(inode->i_mode))
+			err = erofs_mkfs_hot_push_children(&q, inode);
+		else if (!ctx->rebuild)
+			item.d->flags |= EROFS_DENTRY_FLAG_NLINK_COUNTED;
+	}
+	free(q.items);
+	return err;
+}
+
 static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 {
 	struct erofs_importer *im = ctx->im;
@@ -2173,11 +2344,14 @@ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 	struct erofs_sb_info *sbi = root->sbi;
 	struct erofs_inode *dumpdir = erofs_igrab(root);
 	bool grouped_dirdata = im->params->grouped_dirdata;
+	bool hot = erofs_hotfile_enabled();
 	LIST_HEAD(pending_dirs);
 	int err, err2;
 
 	erofs_mark_parent_inode(root, root);	/* rootdir mark */
 	root->next_dirwrite = NULL;
+	if (hot)
+		root->hot_rank = 0;
 	/* update dev/i_ino[1] to keep track of the base image */
 	if (ctx->incremental) {
 		root->dev = root->sbi->dev;
@@ -2203,6 +2377,14 @@ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 		erofs_mkfs_flushjobs(sbi);
 		erofs_fixup_meta_blkaddr(root);
 		sbi->root_nid = root->nid;
+	}
+
+	if (hot) {
+		err = erofs_mkfs_dump_hot_tree(ctx);
+		if (err) {
+			erofs_iput(dumpdir);
+			return err;
+		}
 	}
 
 	do {
@@ -2233,7 +2415,13 @@ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 					last = &inode->next_dirwrite;
 					(void)erofs_igrab(inode);
 				}
-			} else if (!ctx->rebuild) {
+			} else if (hot && S_ISDIR(inode->i_mode)) {
+				/* hot pass dumped it, walk cold entries now */
+				*last = inode;
+				last = &inode->next_dirwrite;
+				(void)erofs_igrab(inode);
+			} else if (!ctx->rebuild && !(d->flags &
+					EROFS_DENTRY_FLAG_NLINK_COUNTED)) {
 				++inode->i_nlink;
 			}
 		}
