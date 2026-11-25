@@ -2582,7 +2582,7 @@ int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
 				.length = map.m_llen,
 				.plen = erofs_blksiz(sbi),
 				.pstart = (pend != EROFS_NULL_ADDR ? pend : 0),
-				.device_id = inode->dev,	/* FIXME! */
+				.device_id = 0,
 				.raw = raw,
 				.inlined = true,
 			};
@@ -2591,11 +2591,16 @@ int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
 				EROFS_IDATA_TYPE_COMPRESSED_DEFAULT);
 			DBG_BUGON(map.m_la + map.m_llen != inode->i_size);
 		} else {
+			if (sbi->extra_devices && !mdev.m_deviceid) {
+				err = -EOPNOTSUPP;
+				goto err_free_ei;
+			}
 			ei->e = (struct z_erofs_inmem_extent) {
 				.length = map.m_llen,
 				.plen = map.m_plen,
 				.pstart = mdev.m_pa,
-				.device_id = inode->dev,	/* FIXME! */
+				.device_id = sbi->rebuild_devbase + mdev.m_deviceid -
+					!!sbi->extra_devices,
 				.partial = map.m_flags & EROFS_MAP_PARTIAL_REF,
 				.raw = raw,
 				.inlined = false,

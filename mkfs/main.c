@@ -1045,8 +1045,10 @@ static int mkfs_parse_sources(int argc, char *argv[], int optind)
 		return -EINVAL;
 	}
 
-	if (source_mode == EROFS_MKFS_SOURCE_REBUILD) {
-		char *srcpath = cfg.c_src_path;
+	if (source_mode == EROFS_MKFS_SOURCE_REBUILD ||
+	    (source_mode == EROFS_MKFS_SOURCE_TAR && optind < argc)) {
+		char *srcpath = source_mode == EROFS_MKFS_SOURCE_TAR ?
+			argv[optind++] : cfg.c_src_path;
 		struct erofs_sb_info *src;
 
 		do {
@@ -1667,12 +1669,11 @@ void erofs_show_progs(int argc, char *argv[])
 
 static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 {
-	struct erofs_device_info *devs;
 	struct erofs_sb_info *src;
-	unsigned int extra_devices = 0;
-	erofs_blk_t nblocks;
-	int ret, idx;
+	unsigned int devices = 0, i;
+	bool tar_overlay = source_mode == EROFS_MKFS_SOURCE_TAR;
 	enum erofs_rebuild_datamode datamode;
+	int ret;
 
 	switch (dataimport_mode) {
 	case EROFS_MKFS_DATA_IMPORT_DEFAULT:
@@ -1687,59 +1688,68 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 	default:
 		return -EINVAL;
 	}
+	if (tar_overlay && (datamode != EROFS_REBUILD_DATA_BLOB_INDEX ||
+			    incremental_mode || erofstar.index_mode))
+		return -EOPNOTSUPP;
+
+	/* Input order determines device numbering; upper trees are loaded first. */
+	list_for_each_entry_reverse(src, &rebuild_src_list, list) {
+		ret = erofs_read_superblock(src);
+		if (ret)
+			return ret;
+		ret = erofs_rebuild_count_devices(src);
+		if (ret < 0)
+			return ret;
+		src->rebuild_devcount = ret;
+		if (devices + src->rebuild_devcount +
+		    (tar_overlay && !!mkfscfg.blobdev_path) > UINT16_MAX)
+			return -EOVERFLOW;
+		if (src->blkszbits != g_sbi.blkszbits)
+			return -EOPNOTSUPP;
+		src->rebuild_devbase = devices + 1;
+		devices += src->rebuild_devcount;
+	}
 
 	list_for_each_entry(src, &rebuild_src_list, list) {
 		src->xamgr = g_sbi.xamgr;
-		ret = erofs_rebuild_load_tree(root, src, datamode);
+		ret = erofs_rebuild_load_tree(root, src, datamode,
+			src == list_first_entry(&rebuild_src_list, struct erofs_sb_info, list));
 		src->xamgr = NULL;
-		if (ret) {
-			erofs_err("failed to load %s", src->dif0.src_path);
+		if (ret)
 			return ret;
-		}
-		if (src->extra_devices > 1) {
-			erofs_err("%s: unsupported number %u of extra devices",
-				  src->dif0.src_path, src->extra_devices);
-			return -EOPNOTSUPP;
-		}
-		extra_devices += src->extra_devices;
+		if (root->opaque)
+			break;
 	}
-
-	if (datamode == EROFS_REBUILD_DATA_RESVSP)
+	if (datamode != EROFS_REBUILD_DATA_BLOB_INDEX)
 		return 0;
 
-	/* Each blob has either no extra device or only one device for TarFS */
-	if (extra_devices && extra_devices != rebuild_src_count) {
-		erofs_err("extra_devices(%u) is mismatched with source images(%u)",
-			  extra_devices, rebuild_src_count);
-		return -EOPNOTSUPP;
-	}
-
-	if (datamode == EROFS_REBUILD_DATA_FULL)
-		return 0;
-
-	ret = erofs_mkfs_init_devices(&g_sbi, rebuild_src_count);
+	ret = erofs_mkfs_init_devices(&g_sbi,
+		devices + (tar_overlay && !!mkfscfg.blobdev_path));
 	if (ret)
 		return ret;
-
-	devs = g_sbi.devs;
 	list_for_each_entry(src, &rebuild_src_list, list) {
-		u8 *tag = NULL;
+		if (!src->rebuild_devcount)
+			continue;
+		for (i = 0; i < src->rebuild_devcount; ++i) {
+			struct erofs_device_info *dev =
+				&g_sbi.devs[src->rebuild_devbase - 1 + i];
 
-		DBG_BUGON(src->dev < 1);
-		idx = src->dev - 1;
-		if (extra_devices) {
-			nblocks = src->devs[0].blocks;
-			tag = src->devs[0].tag;
-		} else {
-			nblocks = src->dif0.blocks;
-			devs[idx].src_path = strdup(src->dif0.src_path);
+			if (src->extra_devices) {
+				dev->blocks = src->devs[i].blocks;
+				memcpy(dev->tag, src->devs[i].tag, sizeof(dev->tag));
+			} else {
+				dev->blocks = src->dif0.blocks;
+				dev->src_path = strdup(src->dif0.src_path);
+				if (!dev->src_path)
+					return -ENOMEM;
+			}
+			if (!dev->tag[0]) {
+				erofs_uuid_unparse_as_tag(src->uuid, (char *)dev->tag);
+				if (src->extra_devices > 1)
+					snprintf((char *)dev->tag + 32, sizeof(dev->tag) - 32,
+						 "-%u", i + 1);
+			}
 		}
-		devs[idx].blocks = nblocks;
-		if (tag && *tag)
-			memcpy(devs[idx].tag, tag, sizeof(devs[0].tag));
-		else
-			/* convert UUID of the source image to a hex string */
-			erofs_uuid_unparse_as_tag(src->uuid, (char *)devs[idx].tag);
 	}
 	return 0;
 }
@@ -1955,7 +1965,7 @@ int main(int argc, char **argv)
 	}
 
 	cfg.c_dedupe = importer_params.dedupe;
-	if (tar_index_512b || mkfscfg.blobdev_path) {
+	if (!rebuild_src_count && (tar_index_512b || mkfscfg.blobdev_path)) {
 		err = erofs_mkfs_init_devices(&g_sbi, 1);
 		if (err) {
 			erofs_err("failed to generate device table: %s",
@@ -2032,8 +2042,34 @@ int main(int argc, char **argv)
 
 	importer.root = root;
 	if (source_mode == EROFS_MKFS_SOURCE_TAR) {
+		if (rebuild_src_count) {
+			err = erofs_mkfs_rebuild_load_trees(root);
+			if (err)
+				goto exit;
+			if (mkfscfg.blobdev_path) {
+				unsigned int id = g_sbi.extra_devices;
+
+				g_sbi.devs[id - 1].src_path = strdup(mkfscfg.blobdev_path);
+				if (!g_sbi.devs[id - 1].src_path) {
+					err = -ENOMEM;
+					goto exit;
+				}
+				err = erofs_blob_init_device(&g_sbi, id);
+				if (err)
+					goto exit;
+				importer_params.ddev_id_def = id;
+			}
+			erofstar.layer = 1;
+			init_list_head(&erofstar.whiteouts);
+		}
 		while (!(err = tarerofs_parse_tar(&importer, &erofstar)))
 			;
+		if (erofstar.layer) {
+			int ret = tarerofs_finish_layer(&importer, &erofstar, err > 0);
+
+			if (err > 0)
+				err = ret;
+		}
 	} else if (source_mode == EROFS_MKFS_SOURCE_REBUILD) {
 		err = erofs_mkfs_rebuild_load_trees(root);
 #ifdef S3EROFS_ENABLED

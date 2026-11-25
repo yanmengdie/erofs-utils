@@ -543,6 +543,23 @@ not depend on external blob devices.
 \fB\-\-clean=rvsp\fR or \fB\-\-incremental=rvsp\fR: Reserve space for file
 data without copying actual content, useful for creating sparse images.
 .RE
+
+.PP
+TAR full import can apply an upper archive directly to existing EROFS sources:
+.PP
+.nf
+mkfs.erofs -zlz4 --tar=f --aufs --ovlfs-strip=1 -Enoinline_data \\
+  --blobdev=upper.blob merged.erofs upper.tar lower.erofs
+.fi
+.PP
+Additional EROFS sources are ordered from lower to upper. The TAR is applied
+last, so hardlinks can resolve against lower files before later replacements.
+The new image references existing external data devices and writes new payloads
+to upper.blob. No namespace plan image is needed. Enable the source compression
+algorithms with \fB-z\fR and use matching block sizes. TAR overlays require the
+default blob-index import mode, without incremental or tar-index mode.
+A source with external devices must store non-inline file data on those devices.
+Root metadata comes from the highest EROFS source, unless the TAR replaces it.
 .SH REPRODUCIBLE BUILDS
 Use the same resolved OCI manifest or TAR bytes, including metadata, and pin
 erofs-utils and compression-library versions. Fix effective layout options,

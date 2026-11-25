@@ -253,6 +253,7 @@ static int erofs_rebuild_load_chunk_index(struct erofs_sb_info *dst_sb,
 	struct erofs_inode_chunk_index *idx;
 	erofs_off_t chunksize;
 	erofs_blk_t blkaddr;
+	unsigned int device_id;
 
 	/* TODO: fill data map in other layouts */
 	if (inode->datalayout == EROFS_INODE_CHUNK_BASED) {
@@ -290,14 +291,34 @@ static int erofs_rebuild_load_chunk_index(struct erofs_sb_info *dst_sb,
 		struct erofs_map_blocks map = {
 			.buf = __EROFS_BUF_INITIALIZER,
 		};
+		struct erofs_map_dev mdev;
 
 		map.m_la = i << chunkbits;
 		ret = erofs_map_blocks(inode, &map, 0);
 		if (ret)
 			goto err;
+		if (!(map.m_flags & EROFS_MAP_MAPPED)) {
+			blkaddr = EROFS_NULL_ADDR;
+			device_id = 0;
+			goto get_chunk;
+		}
 
-		blkaddr = erofs_blknr(dst_sb, map.m_pa);
-		chunk = erofs_get_unhashed_chunk(dst_sb, inode->dev, blkaddr, 0);
+		mdev = (struct erofs_map_dev) {
+			.m_deviceid = map.m_deviceid,
+			.m_pa = map.m_pa,
+		};
+		ret = erofs_map_dev(inode->sbi, &mdev);
+		if (ret)
+			goto err;
+		if (inode->sbi->extra_devices && !mdev.m_deviceid) {
+			ret = -EOPNOTSUPP;
+			goto err;
+		}
+		device_id = inode->sbi->rebuild_devbase + mdev.m_deviceid -
+			!!inode->sbi->extra_devices;
+		blkaddr = erofs_blknr(dst_sb, mdev.m_pa);
+get_chunk:
+		chunk = erofs_get_unhashed_chunk(dst_sb, device_id, blkaddr, 0);
 		if (IS_ERR(chunk)) {
 			ret = PTR_ERR(chunk);
 			goto err;
@@ -423,6 +444,9 @@ static int erofs_rebuild_update_inode(struct erofs_sb_info *dst_sb,
 		if (err)
 			return err;
 		err = erofs_pread(&vf, inode->i_link, inode->i_size, 0);
+		if (err)
+			return err;
+		inode->i_link[inode->i_size] = '\0';
 		erofs_dbg("\tsymlink: %s -> %s", inode->i_srcpath, inode->i_link);
 		break;
 	}
@@ -599,8 +623,9 @@ out:
 	return ret;
 }
 
-int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
-			    enum erofs_rebuild_datamode mode)
+int erofs_rebuild_load_tree(struct erofs_inode *root,
+				struct erofs_sb_info *sbi,
+				enum erofs_rebuild_datamode mode, bool inherit_root)
 {
 	struct erofs_sb_info *dst_sbi = root->sbi;
 	struct erofs_inode inode = {};
@@ -642,6 +667,20 @@ int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
 		erofs_err("failed to read root inode of %s", fsid);
 		return ret;
 	}
+	root->opaque |= erofs_get_opaque_from_disk(&inode);
+	if (inherit_root) {
+		ret = erofs_read_xattrs_from_disk(&inode);
+		list_splice_tail(&inode.i_xattrs, &root->i_xattrs);
+		init_list_head(&inode.i_xattrs);
+		erofs_inode_free_xattrs(&inode);
+		if (ret)
+			return ret;
+		root->i_mode = inode.i_mode;
+		root->i_uid = inode.i_uid;
+		root->i_gid = inode.i_gid;
+		root->i_mtime = inode.i_mtime;
+		root->i_mtime_nsec = inode.i_mtime_nsec;
+	}
 	inode.i_srcpath = strdup("/");
 	if (!inode.i_srcpath)
 		return -ENOMEM;
@@ -654,7 +693,39 @@ int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
 	};
 	ret = erofs_iterate_dir(&ctx.ctx, false);
 	free(inode.i_srcpath);
+	erofs_inode_free_xattrs(&inode);
 	return ret;
+}
+
+static int erofs_rebuild_has_data(struct erofs_dir_context *ctx)
+{
+	struct erofs_inode inode = { .sbi = ctx->dir->sbi, .nid = ctx->de_nid };
+	struct erofs_dir_context child = { .dir = &inode, .cb = erofs_rebuild_has_data };
+	int ret;
+
+	if (ctx->dot_dotdot)
+		return 0;
+	ret = erofs_read_inode_from_disk(&inode);
+	if (ret)
+		return ret;
+	if (S_ISDIR(inode.i_mode))
+		return erofs_iterate_dir(&child, false);
+	return S_ISREG(inode.i_mode) && inode.i_size;
+}
+
+int erofs_rebuild_count_devices(struct erofs_sb_info *sbi)
+{
+	struct erofs_inode root = { .sbi = sbi, .nid = sbi->root_nid };
+	struct erofs_dir_context ctx = { .dir = &root, .cb = erofs_rebuild_has_data };
+	int ret;
+
+	if (sbi->extra_devices)
+		return sbi->extra_devices;
+	ret = erofs_read_inode_from_disk(&root);
+	if (ret)
+		return ret;
+	/* Directory and symlink payloads are copied, not referenced as blob data. */
+	return erofs_iterate_dir(&ctx, false);
 }
 
 static int erofs_rebuild_basedir_dirent_iter(struct erofs_dir_context *ctx)
