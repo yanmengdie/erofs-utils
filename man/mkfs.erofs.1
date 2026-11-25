@@ -427,6 +427,8 @@ directory.
 \fIMODE\fR may be one of \fBf\fR, \fBi\fR, or \fBheaderball\fR.
 
 \fBf\fR: Generate a full EROFS image from a regular tarball. (default)
+When a TAR omits its root entry, mode 0755 and uid/gid 0 are used, subject to
+explicit ownership options.
 
 \fBi\fR: Generate a meta-only EROFS image from a regular tarball. Only
 metadata such as dentries, inodes, and xattrs will be added to the image,
@@ -530,6 +532,24 @@ not depend on external blob devices.
 \fB\-\-clean=rvsp\fR or \fB\-\-incremental=rvsp\fR: Reserve space for file
 data without copying actual content, useful for creating sparse images.
 .RE
+.SH REPRODUCIBLE BUILDS
+Use the same resolved OCI manifest or TAR bytes, including metadata, and pin
+erofs-utils and compression-library versions. Fix effective layout options,
+including block size, compression settings and build time. For example, use
+\fB-b4096 -T0 --mkfs-time --preserve-mtime -U UUID\fR to retain input mtimes while
+fixing the build timestamp. Control or unset \fBSOURCE_DATE_EPOCH\fR, which
+otherwise overrides the timestamp policy.
+.PP
+Compute UUID before calling mkfs, using a stable namespace and UUIDv5 over an
+unambiguous serialization of the source identity (including parent layers when
+relevant) and the effective build profile. The profile must identify
+output-affecting options and tool/codec versions. Do not include host paths,
+host architecture or wall-clock time. Cross-host builds must select the same
+target-platform manifest, rather than each host's native platform. Different
+filesystem artifacts must not share a constant UUID.
+.PP
+Compare complete image and external-blob digests when validating reproducibility;
+a matching UUID alone does not prove byte-for-byte identity across platforms.
 .SH AUTHOR
 This version of \fBmkfs.erofs\fR is written by Li Guifu <blucerlee@gmail.com>,
 Miao Xie <miaoxie@huawei.com> and Gao Xiang <xiang@kernel.org> with
