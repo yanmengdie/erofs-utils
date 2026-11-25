@@ -24,8 +24,10 @@ static unsigned int hotfile_nr_paths, hotfile_cap_paths;
 static struct erofs_hotfile_entry *hotfile_input;
 static unsigned int hotfile_nr_input, hotfile_cap_input;
 static const char *hotfile_root;
-static bool hotfile_prepared;
+static bool hotfile_prepared, hotfile_has_entries;
 static struct erofs_inode *hotfile_tree;
+static struct erofs_inode **hotfile_staged;
+static size_t hotfile_nr_staged, hotfile_cap_staged;
 
 /* Final-tree lookup only; do not change the imported dentry order. */
 static struct erofs_hotfile_dentry {
@@ -92,6 +94,9 @@ static void erofs_hotfile_drop_index(void)
 	free(hotfile_dentries);
 	hotfile_dentries = NULL;
 	hotfile_nr_dentries = hotfile_cap_dentries = 0;
+	free(hotfile_staged);
+	hotfile_staged = NULL;
+	hotfile_nr_staged = hotfile_cap_staged = 0;
 }
 
 static int erofs_hotfile_cmp(const void *a, const void *b)
@@ -149,11 +154,29 @@ static int erofs_hotfile_add(struct erofs_hotfile_entry **paths,
 			     unsigned int *nr, unsigned int *cap,
 			     char *path, unsigned int rank);
 
-static int erofs_hotfile_add_path(const char *path, unsigned int rank)
+static int erofs_hotfile_record(const char *path, struct erofs_inode *inode,
+				unsigned int rank)
 {
 	char *dup;
 	int err;
 
+	if (hotfile_tree) {
+		if (hotfile_nr_staged == hotfile_cap_staged) {
+			struct erofs_inode **inodes;
+			size_t cap;
+
+			if (hotfile_cap_staged > SIZE_MAX / 2 / sizeof(*inodes))
+				return -ENOMEM;
+			cap = hotfile_cap_staged ? hotfile_cap_staged * 2 : 64;
+			inodes = realloc(hotfile_staged, cap * sizeof(*inodes));
+			if (!inodes)
+				return -ENOMEM;
+			hotfile_staged = inodes;
+			hotfile_cap_staged = cap;
+		}
+		hotfile_staged[hotfile_nr_staged++] = inode;
+		return 0;
+	}
 	if (!path[0])
 		return 0;
 	dup = strdup(path);
@@ -194,7 +217,8 @@ static struct erofs_inode *erofs_hotfile_lookup_tree(const char *path)
 }
 
 /* Prefixes passed here contain neither symlinks nor dot components. */
-static int erofs_hotfile_lookup(const char *path, mode_t *mode, char **target)
+static int erofs_hotfile_lookup(const char *path, mode_t *mode, char **target,
+				struct erofs_inode **inode_out)
 {
 	erofs_os_stat_t st;
 	char *full;
@@ -202,11 +226,13 @@ static int erofs_hotfile_lookup(const char *path, mode_t *mode, char **target)
 
 	*mode = 0;
 	*target = NULL;
+	*inode_out = NULL;
 	if (hotfile_tree) {
 		struct erofs_inode *inode = erofs_hotfile_lookup_tree(path);
 
 		if (IS_ERR(inode))
 			return PTR_ERR(inode);
+		*inode_out = inode;
 		*mode = inode->i_mode;
 		if (S_ISLNK(*mode)) {
 			if (!inode->i_link)
@@ -253,14 +279,17 @@ static int erofs_hotfile_resolve(const char *path, unsigned int rank)
 {
 	char *pending = strdup(path), *prefix = strdup("");
 	unsigned int links = 0;
+	size_t i;
 	int err = 0;
 
+	hotfile_nr_staged = 0;
 	if (!pending || !prefix) {
 		err = -ENOMEM;
 		goto out;
 	}
 	while (*pending) {
 		char *part = pending, *end, *suffix, *next, *target;
+		struct erofs_inode *inode;
 		mode_t mode;
 		size_t parentlen = strlen(prefix);
 		bool has_slash;
@@ -298,7 +327,7 @@ static int erofs_hotfile_resolve(const char *path, unsigned int rank)
 		}
 		free(prefix);
 		prefix = next;
-		err = erofs_hotfile_lookup(prefix, &mode, &target);
+		err = erofs_hotfile_lookup(prefix, &mode, &target, &inode);
 		if (err) {
 			free(suffix);
 			goto out;
@@ -310,7 +339,7 @@ static int erofs_hotfile_resolve(const char *path, unsigned int rank)
 				err = -ENOENT;
 				goto out;
 			}
-			err = erofs_hotfile_add_path(prefix, rank);
+			err = erofs_hotfile_record(prefix, inode, rank);
 			if (!err && ++links > 40)
 				err = -ELOOP;
 			if (!err && asprintf(&next, "%s%s%s", target,
@@ -336,13 +365,18 @@ static int erofs_hotfile_resolve(const char *path, unsigned int rank)
 			err = -ENOENT;
 			goto out;
 		}
-		err = erofs_hotfile_add_path(prefix, rank);
+		err = erofs_hotfile_record(prefix, inode, rank);
 		if (err) {
 			free(suffix);
 			goto out;
 		}
 		free(pending);
 		pending = suffix;
+	}
+	for (i = 0; i < hotfile_nr_staged; ++i) {
+		hotfile_staged[i]->hot_rank =
+			min(hotfile_staged[i]->hot_rank, rank);
+		hotfile_has_entries = true;
 	}
 out:
 	free(prefix);
@@ -472,13 +506,14 @@ int erofs_hotfile_load(const char *path, const char *root)
 	}
 	erofs_hotfile_sort();
 	hotfile_prepared = hotfile_root != NULL;
+	hotfile_has_entries = hotfile_nr_paths != 0;
 	erofs_info("loaded %u hot paths from %s", nr, path);
 	return 0;
 }
 
 bool erofs_hotfile_enabled(void)
 {
-	return hotfile_prepared ? hotfile_nr_paths != 0 : hotfile_nr_input != 0;
+	return hotfile_prepared ? hotfile_has_entries : hotfile_nr_input != 0;
 }
 
 static unsigned int erofs_hotfile_find_rank(const char *path)
@@ -535,37 +570,21 @@ static void erofs_hotfile_clear_paths(void)
 	hotfile_nr_paths = hotfile_cap_paths = 0;
 }
 
-static int erofs_hotfile_walk_tree(struct erofs_inode *inode, const char *path,
-				  bool clear)
+static int erofs_hotfile_index_tree(struct erofs_inode *inode)
 {
 	struct erofs_dentry *d;
-	unsigned int rank;
+	int err;
 
-	if (clear) {
-		inode->hot_rank = EROFS_HOT_RANK_NONE;
-	} else {
-		/* hardlinks take the earliest rank of all surviving names */
-		rank = erofs_hotfile_rank(path);
-		inode->hot_rank = min(inode->hot_rank, rank);
-	}
+	inode->hot_rank = EROFS_HOT_RANK_NONE;
 	if (!S_ISDIR(inode->i_mode))
 		return 0;
 	list_for_each_entry(d, &inode->i_subdirs, d_child) {
-		char *child = NULL;
-		int err;
-
 		if (is_dot_dotdot(d->name))
 			continue;
-		if (clear) {
-			err = erofs_hotfile_index_dentry(inode, d);
-			if (err)
-				return err;
-		}
-		if (!clear && asprintf(&child, "%s%s%s", path,
-				       *path ? "/" : "", d->name) < 0)
-			return -ENOMEM;
-		err = erofs_hotfile_walk_tree(d->inode, child, clear);
-		free(child);
+		err = erofs_hotfile_index_dentry(inode, d);
+		if (err)
+			return err;
+		err = erofs_hotfile_index_tree(d->inode);
 		if (err)
 			return err;
 	}
@@ -583,43 +602,34 @@ static void erofs_hotfile_clear_input(void)
 	hotfile_nr_input = hotfile_cap_input = 0;
 }
 
-static int erofs_hotfile_prepare_paths(struct erofs_inode *root)
-{
-	unsigned int i;
-	int err;
-
-	erofs_hotfile_clear_paths();
-	for (i = 0; i < hotfile_nr_input; ++i) {
-		err = erofs_hotfile_add_resolved_path(hotfile_input[i].path,
-						    hotfile_input[i].rank);
-		if (err)
-			return err;
-	}
-	erofs_hotfile_sort();
-	erofs_hotfile_clear_input();
-	hotfile_prepared = true;
-	return erofs_hotfile_walk_tree(root, "", false);
-}
-
 /*
  * For archive sources, hot paths can only be resolved once the final tree
  * has been imported (later entries may replace or remove earlier ones).
  */
 int erofs_hotfile_prepare_tree(struct erofs_inode *root)
 {
+	unsigned int i;
 	int err;
 
 	if (!erofs_hotfile_enabled())
 		return 0;
 	hotfile_tree = root;
+	hotfile_has_entries = false;
 	/* Clear shared inodes before aggregating only surviving aliases. */
-	err = erofs_hotfile_walk_tree(root, NULL, true);
+	err = erofs_hotfile_index_tree(root);
 	if (err)
 		goto out;
 	if (hotfile_nr_dentries)
 		qsort(hotfile_dentries, hotfile_nr_dentries,
 		      sizeof(*hotfile_dentries), erofs_hotfile_dentry_cmp);
-	err = erofs_hotfile_prepare_paths(root);
+	for (i = 0; i < hotfile_nr_input; ++i) {
+		err = erofs_hotfile_add_resolved_path(hotfile_input[i].path,
+						      hotfile_input[i].rank);
+		if (err)
+			goto out;
+	}
+	erofs_hotfile_clear_input();
+	hotfile_prepared = true;
 out:
 	erofs_hotfile_drop_index();
 	hotfile_tree = NULL;
@@ -633,4 +643,5 @@ void erofs_hotfile_exit(void)
 	hotfile_root = NULL;
 	hotfile_tree = NULL;
 	hotfile_prepared = false;
+	hotfile_has_entries = false;
 }
