@@ -16,7 +16,7 @@ int erofs_hotfile_prepare_tree(struct erofs_inode *root);
 void erofs_hotfile_exit(void);
 bool erofs_hotfile_enabled(void);
 
-unsigned int erofs_hotfile_rank(const char *path, bool isdir);
+unsigned int erofs_hotfile_rank(const char *path);
 
 #ifdef __cplusplus
 }

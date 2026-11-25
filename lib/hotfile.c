@@ -14,19 +14,13 @@
 #include "erofs/inode.h"
 #include "erofs/print.h"
 
-struct erofs_hotfile_manifest {
-	struct erofs_hotfile_entry {
-		char *path;
-		unsigned int rank;
-	} *file_paths;
-	unsigned int nr_files;
-	unsigned int cap_files;
-	struct erofs_hotfile_entry *dir_paths;
-	unsigned int nr_dirs;
-	unsigned int cap_dirs;
+struct erofs_hotfile_entry {
+	char *path;
+	unsigned int rank;
 };
 
-static struct erofs_hotfile_manifest hotfile_manifest;
+static struct erofs_hotfile_entry *hotfile_paths;
+static unsigned int hotfile_nr_paths, hotfile_cap_paths;
 static struct erofs_hotfile_entry *hotfile_input;
 static unsigned int hotfile_nr_input, hotfile_cap_input;
 static const char *hotfile_root;
@@ -151,11 +145,11 @@ static char *erofs_hotfile_normalize(const char *path)
 	return out;
 }
 
-static int erofs_hotfile_add_file(char *path, unsigned int rank);
-static int erofs_hotfile_add_dir(char *path, unsigned int rank);
+static int erofs_hotfile_add(struct erofs_hotfile_entry **paths,
+			     unsigned int *nr, unsigned int *cap,
+			     char *path, unsigned int rank);
 
-static int erofs_hotfile_add_plain_path(const char *path, bool dir_entry,
-					unsigned int rank)
+static int erofs_hotfile_add_path(const char *path, unsigned int rank)
 {
 	char *dup;
 	int err;
@@ -165,8 +159,8 @@ static int erofs_hotfile_add_plain_path(const char *path, bool dir_entry,
 	dup = strdup(path);
 	if (!dup)
 		return -ENOMEM;
-	err = dir_entry ? erofs_hotfile_add_dir(dup, rank) :
-		erofs_hotfile_add_file(dup, rank);
+	err = erofs_hotfile_add(&hotfile_paths, &hotfile_nr_paths,
+				&hotfile_cap_paths, dup, rank);
 	if (err)
 		free(dup);
 	return err;
@@ -255,14 +249,12 @@ static int erofs_hotfile_lookup(const char *path, mode_t *mode, char **target)
 }
 
 /* Apply .. only after preceding symlinks, anchored at the image root. */
-static int erofs_hotfile_resolve(const char *path, unsigned int rank,
-				 char **resolved)
+static int erofs_hotfile_resolve(const char *path, unsigned int rank)
 {
 	char *pending = strdup(path), *prefix = strdup("");
 	unsigned int links = 0;
 	int err = 0;
 
-	*resolved = NULL;
 	if (!pending || !prefix) {
 		err = -ENOMEM;
 		goto out;
@@ -318,7 +310,7 @@ static int erofs_hotfile_resolve(const char *path, unsigned int rank,
 				err = -ENOENT;
 				goto out;
 			}
-			err = erofs_hotfile_add_plain_path(prefix, false, rank);
+			err = erofs_hotfile_add_path(prefix, rank);
 			if (!err && ++links > 40)
 				err = -ELOOP;
 			if (!err && asprintf(&next, "%s%s%s", target,
@@ -344,18 +336,14 @@ static int erofs_hotfile_resolve(const char *path, unsigned int rank,
 			err = -ENOENT;
 			goto out;
 		}
-		if (S_ISDIR(mode)) {
-			err = erofs_hotfile_add_plain_path(prefix, true, rank);
-			if (err) {
-				free(suffix);
-				goto out;
-			}
+		err = erofs_hotfile_add_path(prefix, rank);
+		if (err) {
+			free(suffix);
+			goto out;
 		}
 		free(pending);
 		pending = suffix;
 	}
-	*resolved = prefix;
-	prefix = NULL;
 out:
 	free(prefix);
 	free(pending);
@@ -364,23 +352,12 @@ out:
 
 static int erofs_hotfile_add_resolved_path(const char *path, unsigned int rank)
 {
-	char *resolved;
-	size_t len = strlen(path);
-	unsigned int nr_files = hotfile_manifest.nr_files;
-	unsigned int nr_dirs = hotfile_manifest.nr_dirs;
-	int err = erofs_hotfile_resolve(path, rank, &resolved);
+	unsigned int nr_paths = hotfile_nr_paths;
+	int err = erofs_hotfile_resolve(path, rank);
 
-	if (!err) {
-		err = erofs_hotfile_add_plain_path(resolved,
-					len && path[len - 1] == '/', rank);
-		free(resolved);
-	} else {
-		struct erofs_hotfile_manifest *m = &hotfile_manifest;
-
-		while (m->nr_files > nr_files)
-			free(m->file_paths[--m->nr_files].path);
-		while (m->nr_dirs > nr_dirs)
-			free(m->dir_paths[--m->nr_dirs].path);
+	if (err) {
+		while (hotfile_nr_paths > nr_paths)
+			free(hotfile_paths[--hotfile_nr_paths].path);
 		/* a stale or broken entry should not fail the whole build */
 		if (err != -ENOENT && err != -ENOTDIR && err != -ELOOP)
 			return err;
@@ -400,7 +377,7 @@ static int erofs_hotfile_add(struct erofs_hotfile_entry **paths,
 		unsigned int ncap;
 
 		if (*cap > UINT_MAX / 2 ||
-		    *cap > SIZE_MAX / 2 / sizeof(*npaths))
+		    (size_t)*cap > SIZE_MAX / 2 / sizeof(*npaths))
 			return -ENOMEM;
 		ncap = *cap ? *cap * 2 : 64;
 		npaths = realloc(*paths, ncap * sizeof(*npaths));
@@ -415,52 +392,29 @@ static int erofs_hotfile_add(struct erofs_hotfile_entry **paths,
 	return 0;
 }
 
-static int erofs_hotfile_add_file(char *path, unsigned int rank)
-{
-	return erofs_hotfile_add(&hotfile_manifest.file_paths,
-				 &hotfile_manifest.nr_files,
-				 &hotfile_manifest.cap_files,
-				 path, rank);
-}
-
-static int erofs_hotfile_add_dir(char *path, unsigned int rank)
-{
-	return erofs_hotfile_add(&hotfile_manifest.dir_paths,
-				 &hotfile_manifest.nr_dirs,
-				 &hotfile_manifest.cap_dirs,
-				 path, rank);
-}
-
-static unsigned int erofs_hotfile_sort_dedupe(struct erofs_hotfile_entry *paths,
-					      unsigned int nr)
+static void erofs_hotfile_sort(void)
 {
 	unsigned int i, out = 0;
 
-	if (!nr)
-		return 0;
+	if (!hotfile_nr_paths)
+		return;
 
-	qsort(paths, nr, sizeof(paths[0]), erofs_hotfile_cmp);
-	for (i = 0; i < nr; ++i) {
-		if (out && !strcmp(paths[out - 1].path, paths[i].path)) {
-			if (paths[i].rank < paths[out - 1].rank) {
-				free(paths[out - 1].path);
-				paths[out - 1] = paths[i];
+	qsort(hotfile_paths, hotfile_nr_paths, sizeof(*hotfile_paths),
+	      erofs_hotfile_cmp);
+	for (i = 0; i < hotfile_nr_paths; ++i) {
+		if (out && !strcmp(hotfile_paths[out - 1].path,
+				   hotfile_paths[i].path)) {
+			if (hotfile_paths[i].rank < hotfile_paths[out - 1].rank) {
+				free(hotfile_paths[out - 1].path);
+				hotfile_paths[out - 1] = hotfile_paths[i];
 			} else {
-				free(paths[i].path);
+				free(hotfile_paths[i].path);
 			}
 			continue;
 		}
-		paths[out++] = paths[i];
+		hotfile_paths[out++] = hotfile_paths[i];
 	}
-	return out;
-}
-
-static void erofs_hotfile_sort(void)
-{
-	hotfile_manifest.nr_files = erofs_hotfile_sort_dedupe(
-		hotfile_manifest.file_paths, hotfile_manifest.nr_files);
-	hotfile_manifest.nr_dirs = erofs_hotfile_sort_dedupe(
-		hotfile_manifest.dir_paths, hotfile_manifest.nr_dirs);
+	hotfile_nr_paths = out;
 }
 
 int erofs_hotfile_load(const char *path, const char *root)
@@ -524,19 +478,16 @@ int erofs_hotfile_load(const char *path, const char *root)
 
 bool erofs_hotfile_enabled(void)
 {
-	return hotfile_prepared ?
-		hotfile_manifest.nr_files || hotfile_manifest.nr_dirs :
-		hotfile_nr_input != 0;
+	return hotfile_prepared ? hotfile_nr_paths != 0 : hotfile_nr_input != 0;
 }
 
-static unsigned int erofs_hotfile_find_rank(const char *path,
-				  const struct erofs_hotfile_entry *paths,
-				  unsigned int nr)
+static unsigned int erofs_hotfile_find_rank(const char *path)
 {
 	const struct erofs_hotfile_entry *found;
 
-	found = nr ? bsearch(path, paths, nr, sizeof(*paths),
-			     erofs_hotfile_path_cmp) : NULL;
+	found = hotfile_nr_paths ?
+		bsearch(path, hotfile_paths, hotfile_nr_paths,
+			sizeof(*hotfile_paths), erofs_hotfile_path_cmp) : NULL;
 	return found ? found->rank : EROFS_HOT_RANK_NONE;
 }
 
@@ -554,36 +505,22 @@ static bool erofs_hotfile_path_normalized(const char *path)
 	return true;
 }
 
-static unsigned int erofs_hotfile_get_rank(const char *path,
-				 const struct erofs_hotfile_entry *paths,
-				 unsigned int nr)
+/* Return the hot-file-list position of @path or EROFS_HOT_RANK_NONE */
+unsigned int erofs_hotfile_rank(const char *path)
 {
 	char *normalized;
 	unsigned int rank;
 
-	if (!nr || !erofs_hotfile_enabled())
+	if (!hotfile_nr_paths)
 		return EROFS_HOT_RANK_NONE;
 	path = erofs_fspath(path);
 	if (erofs_hotfile_path_normalized(path))
-		return erofs_hotfile_find_rank(path, paths, nr);
+		return erofs_hotfile_find_rank(path);
 	normalized = erofs_hotfile_normalize(path);
 	if (!normalized)
 		return EROFS_HOT_RANK_NONE;
-	rank = erofs_hotfile_find_rank(normalized, paths, nr);
+	rank = erofs_hotfile_find_rank(normalized);
 	free(normalized);
-	return rank;
-}
-
-/* Return the hot-file-list position of @path or EROFS_HOT_RANK_NONE */
-unsigned int erofs_hotfile_rank(const char *path, bool isdir)
-{
-	struct erofs_hotfile_manifest *m = &hotfile_manifest;
-	unsigned int rank;
-
-	rank = erofs_hotfile_get_rank(path, m->file_paths, m->nr_files);
-	if (isdir)
-		rank = min(rank, erofs_hotfile_get_rank(path, m->dir_paths,
-							m->nr_dirs));
 	return rank;
 }
 
@@ -591,18 +528,11 @@ static void erofs_hotfile_clear_paths(void)
 {
 	unsigned int i;
 
-	for (i = 0; i < hotfile_manifest.nr_files; ++i)
-		free(hotfile_manifest.file_paths[i].path);
-	for (i = 0; i < hotfile_manifest.nr_dirs; ++i)
-		free(hotfile_manifest.dir_paths[i].path);
-	free(hotfile_manifest.file_paths);
-	free(hotfile_manifest.dir_paths);
-	hotfile_manifest.file_paths = NULL;
-	hotfile_manifest.nr_files = 0;
-	hotfile_manifest.cap_files = 0;
-	hotfile_manifest.dir_paths = NULL;
-	hotfile_manifest.nr_dirs = 0;
-	hotfile_manifest.cap_dirs = 0;
+	for (i = 0; i < hotfile_nr_paths; ++i)
+		free(hotfile_paths[i].path);
+	free(hotfile_paths);
+	hotfile_paths = NULL;
+	hotfile_nr_paths = hotfile_cap_paths = 0;
 }
 
 static int erofs_hotfile_walk_tree(struct erofs_inode *inode, const char *path,
@@ -615,7 +545,7 @@ static int erofs_hotfile_walk_tree(struct erofs_inode *inode, const char *path,
 		inode->hot_rank = EROFS_HOT_RANK_NONE;
 	} else {
 		/* hardlinks take the earliest rank of all surviving names */
-		rank = erofs_hotfile_rank(path, S_ISDIR(inode->i_mode));
+		rank = erofs_hotfile_rank(path);
 		inode->hot_rank = min(inode->hot_rank, rank);
 	}
 	if (!S_ISDIR(inode->i_mode))

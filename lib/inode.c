@@ -1376,8 +1376,7 @@ static int erofs_fill_inode(struct erofs_importer *im, struct erofs_inode *inode
 			return -ENOMEM;
 	}
 	if (!erofs_is_special_identifier(path))
-		inode->hot_rank = erofs_hotfile_rank(path,
-						     S_ISDIR(inode->i_mode));
+		inode->hot_rank = erofs_hotfile_rank(path);
 
 	if (erofs_should_use_inode_extended(im, inode, path)) {
 		if (params->force_inodeversion == EROFS_FORCE_INODE_COMPACT) {
@@ -1444,7 +1443,7 @@ static struct erofs_inode *erofs_iget_from_local(struct erofs_importer *im,
 		if (inode) {
 			/* take the earliest rank among all hardlinks */
 			inode->hot_rank = min(inode->hot_rank,
-					      erofs_hotfile_rank(path, false));
+					      erofs_hotfile_rank(path));
 			return inode;
 		}
 	}
