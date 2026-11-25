@@ -785,7 +785,7 @@ int tarerofs_parse_tar(struct erofs_importer *im, struct erofs_tarfile *tar)
 
 	struct tar_header *th;
 	struct erofs_dentry *d;
-	struct erofs_inode *inode;
+	struct erofs_inode *inode, *parent;
 	unsigned int csum, cksum;
 	int ckksum, ret, rem, j;
 
@@ -1060,7 +1060,8 @@ out_eot:
 
 	erofs_dbg("parsing %s (mode %05o)", eh.path, st.st_mode);
 
-	d = erofs_rebuild_get_dentry(root, eh.path, tar->aufs, &whout, &opq, true);
+	d = erofs_rebuild_get_dentry(root, eh.path, tar->aufs,
+				     &whout, &opq, true, &parent);
 	if (IS_ERR(d)) {
 		ret = PTR_ERR(d);
 		goto out;
@@ -1093,7 +1094,7 @@ out_eot:
 		}
 
 		d2 = erofs_rebuild_get_dentry(root, eh.link, tar->aufs,
-					      &dumb, &dumb, false);
+					      &dumb, &dumb, false, NULL);
 		if (IS_ERR(d2)) {
 			ret = PTR_ERR(d2);
 			goto out;
@@ -1127,8 +1128,6 @@ out_eot:
 		goto out;
 	} else if (d->type != EROFS_FT_UNKNOWN) {
 		if (d->type != EROFS_FT_DIR || !S_ISDIR(st.st_mode)) {
-			struct erofs_inode *parent = d->inode->i_parent;
-
 			tarerofs_remove_inode(d->inode);
 			erofs_iput(d->inode);
 			d->inode = parent;

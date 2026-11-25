@@ -2220,8 +2220,7 @@ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 				continue;
 
 			if (!erofs_inode_visited(inode)) {
-				DBG_BUGON(ctx->rebuild && (inode->i_nlink == 1 ||
-					  S_ISDIR(inode->i_mode)) &&
+				DBG_BUGON(ctx->rebuild && S_ISDIR(inode->i_mode) &&
 					  erofs_parent_inode(inode) != dir);
 				erofs_mark_parent_inode(inode, dir);
 

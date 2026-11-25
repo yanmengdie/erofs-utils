@@ -88,7 +88,8 @@ struct erofs_dentry *erofs_d_lookup(struct erofs_inode *dir, const char *name)
 
 static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 		struct erofs_inode *pwd, char *path, bool aufs,
-		bool *whout, bool *opq, bool to_head, unsigned int depth);
+		bool *whout, bool *opq, bool to_head, unsigned int depth,
+		struct erofs_inode **parent);
 
 static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
 		struct erofs_inode *pwd, struct erofs_inode *link,
@@ -99,7 +100,7 @@ static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
 
 	for (;;) {
 		struct erofs_dentry *d;
-		struct erofs_inode *base;
+		struct erofs_inode *base, *parent;
 
 		if (depth++ >= EROFS_REBUILD_SYMLINK_DEPTH)
 			return ERR_PTR(-ELOOP);
@@ -112,7 +113,8 @@ static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
 		/* absolute targets are resolved from the tree root */
 		base = target[0] == '/' ? root : pwd;
 		d = __erofs_rebuild_get_dentry(root, base, target, false,
-					       &dumb_wh, &dumb_opq, false, depth);
+					       &dumb_wh, &dumb_opq, false,
+					       depth, &parent);
 		if (IS_ERR(d))
 			return ERR_CAST(d);
 		/* target referred to the root or base directory itself ("/", ".") */
@@ -123,14 +125,15 @@ static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
 		if (d->type != EROFS_FT_SYMLINK)
 			return ERR_PTR(-ENOTDIR);
 		/* the target is itself a symlink: keep following the chain */
-		pwd = d->inode->i_parent;
+		pwd = parent;
 		link = d->inode;
 	}
 }
 
 static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 		struct erofs_inode *pwd, char *path, bool aufs,
-		bool *whout, bool *opq, bool to_head, unsigned int depth)
+		bool *whout, bool *opq, bool to_head, unsigned int depth,
+		struct erofs_inode **parent)
 {
 	struct erofs_dentry *d = NULL;
 	char *s = path;
@@ -186,7 +189,6 @@ static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 					list_del(&d->d_child);
 					list_add(&d->d_child, &pwd->i_subdirs);
 				}
-				pwd = d->inode;
 			} else if (slash) {
 				d = erofs_rebuild_mkdir(pwd, s);
 				if (IS_ERR(d))
@@ -198,6 +200,8 @@ static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 				d->type = EROFS_FT_UNKNOWN;
 				d->inode = pwd;
 			}
+			if (parent)
+				*parent = pwd;
 			pwd = d->inode;
 		}
 
@@ -210,10 +214,11 @@ static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
 }
 
 struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
-		char *path, bool aufs, bool *whout, bool *opq, bool to_head)
+		char *path, bool aufs, bool *whout, bool *opq, bool to_head,
+		struct erofs_inode **parent)
 {
 	return __erofs_rebuild_get_dentry(pwd, pwd, path, aufs, whout, opq,
-					  to_head, 0);
+					  to_head, 0, parent);
 }
 
 static int erofs_rebuild_load_chunk_index(struct erofs_sb_info *dst_sb,
@@ -456,7 +461,7 @@ static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 	dname = path + strlen(mergedir->i_srcpath) + 1;
 
 	d = erofs_rebuild_get_dentry(mergedir, dname, false,
-				     &dumb, &dumb, false);
+				     &dumb, &dumb, false, NULL);
 	if (IS_ERR(d)) {
 		ret = PTR_ERR(d);
 		goto out;
@@ -645,7 +650,7 @@ static int erofs_rebuild_basedir_dirent_iter(struct erofs_dir_context *ctx)
 	if (!dname)
 		return -ENOMEM;
 	d = erofs_rebuild_get_dentry(mergedir, dname, false,
-				     &dumb, &dumb, false);
+				     &dumb, &dumb, false, NULL);
 	if (IS_ERR(d)) {
 		ret = PTR_ERR(d);
 		goto out;
