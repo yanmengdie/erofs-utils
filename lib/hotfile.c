@@ -33,29 +33,6 @@ static const char *hotfile_root;
 static bool hotfile_prepared;
 static struct erofs_inode *hotfile_tree;
 
-/*
- * Cache successful local directory lookups only while reading the hot list.
- * Regular files and symlinks are still checked normally.  A bounded cache
- * avoids building an extra tree for a potentially small hot list.
- */
-#define EROFS_HOTFILE_DIR_CACHE_SIZE 256
-static struct erofs_hotfile_cached_dir {
-	char *path;
-	mode_t mode;
-} *hotfile_dir_cache;
-
-static void erofs_hotfile_drop_dir_cache(void)
-{
-	unsigned int i;
-
-	if (!hotfile_dir_cache)
-		return;
-	for (i = 0; i < EROFS_HOTFILE_DIR_CACHE_SIZE; ++i)
-		free(hotfile_dir_cache[i].path);
-	free(hotfile_dir_cache);
-	hotfile_dir_cache = NULL;
-}
-
 /* Final-tree lookup only; do not change the imported dentry order. */
 static struct erofs_hotfile_dentry {
 	struct erofs_inode *parent;
@@ -225,7 +202,6 @@ static struct erofs_inode *erofs_hotfile_lookup_tree(const char *path)
 /* Prefixes passed here contain neither symlinks nor dot components. */
 static int erofs_hotfile_lookup(const char *path, mode_t *mode, char **target)
 {
-	struct erofs_hotfile_cached_dir *cached = NULL;
 	erofs_os_stat_t st;
 	char *full;
 	int err;
@@ -247,16 +223,6 @@ static int erofs_hotfile_lookup(const char *path, mode_t *mode, char **target)
 		}
 		return 0;
 	}
-	if (hotfile_dir_cache) {
-		u32 hash = erofs_crc32c(~0U, (const u8 *)path, strlen(path));
-
-		hash %= EROFS_HOTFILE_DIR_CACHE_SIZE;
-		cached = &hotfile_dir_cache[hash];
-		if (cached->path && !strcmp(cached->path, path)) {
-			*mode = cached->mode;
-			return 0;
-		}
-	}
 	if (asprintf(&full, "%s/%s", hotfile_root, path) < 0)
 		return -ENOMEM;
 	if (erofs_os_lstat(full, &st)) {
@@ -265,16 +231,6 @@ static int erofs_hotfile_lookup(const char *path, mode_t *mode, char **target)
 		return err;
 	}
 	*mode = st.st_mode;
-	if (cached && S_ISDIR(*mode)) {
-		char *dup = strdup(path);
-
-		/* failing to cache must not fail the lookup itself */
-		if (dup) {
-			free(cached->path);
-			cached->path = dup;
-			cached->mode = *mode;
-		}
-	}
 	if (S_ISLNK(*mode)) {
 		size_t size = st.st_size + 1;
 		ssize_t len;
@@ -520,9 +476,6 @@ int erofs_hotfile_load(const char *path, const char *root)
 	if (!fp)
 		return -errno;
 	hotfile_root = root;
-	if (hotfile_root)
-		hotfile_dir_cache = calloc(EROFS_HOTFILE_DIR_CACHE_SIZE,
-					   sizeof(*hotfile_dir_cache));
 	while ((nread = getline(&line, &linesz, fp)) >= 0) {
 		char *input;
 
@@ -559,7 +512,6 @@ int erofs_hotfile_load(const char *path, const char *root)
 		err = -EIO;
 	free(line);
 	fclose(fp);
-	erofs_hotfile_drop_dir_cache();
 	if (err) {
 		erofs_hotfile_exit();
 		return err;
