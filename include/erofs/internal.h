@@ -208,6 +208,7 @@ struct erofs_diskbuf;
 #define EROFS_INODE_DATA_SOURCE_DISKBUF		2
 #define EROFS_INODE_DATA_SOURCE_RESVSP		3
 #define EROFS_INODE_DATA_SOURCE_REBUILD_BLOB	4
+#define EROFS_INODE_DATA_SOURCE_TAR		5
 
 enum erofs_idata_type {
 	EROFS_IDATA_TYPE_RAW,
@@ -258,8 +259,17 @@ struct erofs_inode {
 		char *i_link;
 		struct erofs_diskbuf *i_diskbuf;
 	};
-	char *rebuild_blobpath;
-	erofs_off_t rebuild_src_dataoff;
+	union {
+		struct {
+			char *rebuild_blobpath;
+			erofs_off_t rebuild_src_dataoff;
+		};
+		struct {
+			/* Borrowed from the tar stream until tree import completes. */
+			erofs_off_t offset;
+			int fd;
+		} tar_source;
+	};
 	unsigned char datalayout;
 	unsigned char inode_isize;
 	/* inline tail-end packing size */

@@ -71,6 +71,8 @@ struct erofs_importer {
 	struct erofs_importer_params *params;
 	struct erofs_sb_info *sbi;
 	struct erofs_inode *root;
+	/* OCI tar backing data is borrowed by inodes until build jobs finish. */
+	struct erofs_vfile *tar_source;
 };
 
 void erofs_importer_preset(struct erofs_importer_params *params);

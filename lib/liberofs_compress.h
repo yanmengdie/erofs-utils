@@ -21,6 +21,9 @@ void erofs_bind_compressed_file_with_fd(struct z_erofs_compress_ictx *ictx,
 					int fd, u64 fpos);
 void z_erofs_free_metadata(struct erofs_inode *inode);
 char *z_erofs_write_metadata(struct erofs_inode *inode);
+void erofs_bind_compressed_file_with_vfile(struct z_erofs_compress_ictx *ictx,
+					    const struct erofs_vfile *vf,
+					    u64 fpos);
 int erofs_begin_compressed_file(struct z_erofs_compress_ictx *ictx);
 int erofs_write_compressed_file(struct z_erofs_compress_ictx *ictx);
 

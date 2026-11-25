@@ -300,6 +300,7 @@ static struct erofs_tarfile erofstar = {
 	.global.xattrs = LIST_HEAD_INIT(erofstar.global.xattrs)
 };
 static bool incremental_mode;
+static bool tar_stream_open;
 static u8 metabox_algorithmid;
 
 #ifdef S3EROFS_ENABLED
@@ -1007,6 +1008,8 @@ static int mkfs_parse_sources(int argc, char *argv[], int optind)
 		if (err)
 			return err;
 
+		tar_stream_open = true;
+
 		if (erofstar.dumpfile) {
 			fd = erofs_os_open(erofstar.dumpfile,
 					   O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -1550,6 +1553,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 					  tarerofs_decoder);
 		if (err)
 			return err;
+		tar_stream_open = true;
 	}
 
 	if (quiet) {
@@ -1910,6 +1914,36 @@ int main(int argc, char **argv)
 	if (err)
 		goto exit;
 
+	if (source_mode == EROFS_MKFS_SOURCE_TAR &&
+	    !erofstar.index_mode && !erofstar.headeronly_mode &&
+	    !erofstar.rvsp_mode && !erofstar.ddtaridx_mode &&
+	    erofstar.ios.decoder == EROFS_IOS_DECODER_NONE &&
+	    !erofstar.ios.vf.ops && erofstar.ios.sz &&
+	    erofstar.ios.dumpfd < 0 &&
+	    !mkfscfg.chunkbits && !cfg.c_dry_run) {
+		erofs_os_stat_t st;
+
+		if (erofs_os_fstat(erofstar.ios.vf.fd, &st)) {
+			err = -errno;
+			goto exit;
+		}
+		erofstar.direct_data = S_ISREG(st.st_mode);
+#ifdef HAVE_POSIX_FADVISE
+		if (erofstar.direct_data &&
+		    !(erofstar.try_no_reorder && !g_sbi.available_compr_algs &&
+		      importer_params.no_datainline)) {
+			int ret;
+
+			/* Deferred payload reads follow inode order, not tar order. */
+			ret = posix_fadvise(erofstar.ios.vf.fd, 0, 0,
+					    POSIX_FADV_NORMAL);
+			if (ret)
+				erofs_warn("failed to reset tar readahead: %s, ignored.",
+					   erofs_strerror(-ret));
+		}
+#endif
+	}
+
 	if (importer_params.dedupe == EROFS_DEDUPE_FORCE_ON &&
 	    g_sbi.available_compr_algs) {
 		err = z_erofs_dedupe_init(erofs_blksiz(&g_sbi));
@@ -2096,8 +2130,8 @@ exit:
 	erofs_xattr_cleanup_name_prefixes();
 	erofs_rebuild_cleanup();
 	erofs_diskbuf_exit();
-	if (!err && source_mode == EROFS_MKFS_SOURCE_TAR) {
-		if (mkfs_aws_zinfo_file) {
+	if (tar_stream_open) {
+		if (!err && mkfs_aws_zinfo_file) {
 			struct erofs_vfile vf;
 			int fd;
 

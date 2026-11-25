@@ -74,7 +74,8 @@ void erofs_iostream_close(struct erofs_iostream *ios)
 		erofs_gzran_builder_final(ios->gb);
 		return;
 	}
-	erofs_io_close(&ios->vf);
+	if (!ios->borrowed_fd)
+		erofs_io_close(&ios->vf);
 }
 
 int erofs_iostream_open(struct erofs_iostream *ios, int fd, int decoder)
@@ -84,6 +85,7 @@ int erofs_iostream_open(struct erofs_iostream *ios, int fd, int decoder)
 	ios->feof = false;
 	ios->tail = ios->head = 0;
 	ios->decoder = decoder;
+	ios->borrowed_fd = false;
 	ios->dumpfd = -1;
 	if (decoder == EROFS_IOS_DECODER_GZIP) {
 #if defined(HAVE_ZLIB)
@@ -1209,6 +1211,17 @@ new_inode:
 				   !sbi->available_compr_algs &&
 				   params->no_datainline) {
 				ret = tarerofs_write_uncompressed_file(inode, tar);
+			} else if (tar->direct_data) {
+				if (dataoff > tar->ios.sz ||
+				    inode->i_size > tar->ios.sz - dataoff) {
+					ret = -EIO;
+					goto out;
+				}
+				/* Read payloads at their TAR offsets without staging to diskbuf. */
+				inode->tar_source.fd = tar->ios.vf.fd;
+				inode->tar_source.offset = dataoff;
+				inode->datasource = EROFS_INODE_DATA_SOURCE_TAR;
+				ret = erofs_iostream_lskip(&tar->ios, inode->i_size) ? -EIO : 0;
 			} else {
 				ret = tarerofs_write_file_data(inode, tar);
 			}

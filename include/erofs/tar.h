@@ -45,6 +45,8 @@ struct erofs_iostream {
 	unsigned int head, tail, bufsize;
 	int decoder, dumpfd;
 	bool feof;
+	/* A raw tar fd owned by the importer, not this parsing cursor. */
+	bool borrowed_fd;
 };
 
 struct erofs_tarfile {
@@ -58,12 +60,15 @@ struct erofs_tarfile {
 	bool index_mode, headeronly_mode, rvsp_mode, aufs;
 	bool ddtaridx_mode;
 	bool try_no_reorder;
+	/* Immutable regular tar; its stream owns the fd through tree import. */
+	bool direct_data;
 };
 
 struct erofs_importer;
 
 void erofs_iostream_close(struct erofs_iostream *ios);
 int erofs_iostream_open(struct erofs_iostream *ios, int fd, int decoder);
+int erofs_iostream_lskip(struct erofs_iostream *ios, u64 bytes);
 int tarerofs_parse_tar(struct erofs_importer *im, struct erofs_tarfile *tar);
 
 #ifdef __cplusplus

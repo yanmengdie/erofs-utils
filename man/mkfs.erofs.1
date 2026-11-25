@@ -429,6 +429,10 @@ directory.
 \fBf\fR: Generate a full EROFS image from a regular tarball. (default)
 When a TAR omits its root entry, mode 0755 and uid/gid 0 are used, subject to
 explicit ownership options.
+For uncompressed regular tar input and regular or compressed output, file data
+can be read directly from the open source at recorded offsets while retaining
+inode ordering. The source contents must remain unchanged until mkfs finishes.
+Compressed input streams and chunk-based output use the staging path.
 
 \fBi\fR: Generate a meta-only EROFS image from a regular tarball. Only
 metadata such as dentries, inodes, and xattrs will be added to the image,
