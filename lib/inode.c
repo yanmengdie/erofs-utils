@@ -176,6 +176,7 @@ struct erofs_dentry *erofs_d_alloc(struct erofs_inode *parent,
 	d->namelen = namelen;
 	d->type = EROFS_FT_UNKNOWN;
 	d->flags = 0;
+	d->tar_layer = 0;
 	list_add_tail(&d->d_child, &parent->i_subdirs);
 	return d;
 }

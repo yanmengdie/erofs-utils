@@ -62,6 +62,9 @@ struct erofs_tarfile {
 	bool try_no_reorder;
 	/* Immutable regular tar; its stream owns the fd through tree import. */
 	bool direct_data;
+	/* Full OCI import: defer whiteouts until all same-layer entries exist. */
+	u32 layer;
+	struct list_head whiteouts;
 };
 
 struct erofs_importer;
@@ -70,6 +73,9 @@ void erofs_iostream_close(struct erofs_iostream *ios);
 int erofs_iostream_open(struct erofs_iostream *ios, int fd, int decoder);
 int erofs_iostream_lskip(struct erofs_iostream *ios, u64 bytes);
 int tarerofs_parse_tar(struct erofs_importer *im, struct erofs_tarfile *tar);
+int tarerofs_finish_layer(struct erofs_importer *im,
+			 struct erofs_tarfile *tar, bool apply);
+void tarerofs_remove_inode(struct erofs_inode *inode);
 
 #ifdef __cplusplus
 }

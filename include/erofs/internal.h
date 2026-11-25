@@ -375,6 +375,8 @@ struct erofs_dentry {
 	};
 	u8 namelen, type;
 	u8 flags;
+	/* Last OCI layer that created or copied up this entry (0 otherwise). */
+	u32 tar_layer;
 	char name[];
 };
 

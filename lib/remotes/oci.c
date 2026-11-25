@@ -19,7 +19,11 @@
 #ifdef HAVE_JSON_C_JSON_H
 #include <json-c/json.h>
 #endif
+#ifdef HAVE_ZLIB
+#include <zlib.h>
+#endif
 #include "erofs/importer.h"
+#include "erofs/inode.h"
 #include "erofs/internal.h"
 #include "erofs/io.h"
 #include "erofs/print.h"
@@ -57,6 +61,11 @@ struct ocierofs_response {
 struct ocierofs_stream {
 	const char *digest;
 	int blobfd;
+	int error;
+#ifdef HAVE_ZLIB
+	z_stream inflater;
+	bool inflate, stream_end;
+#endif
 };
 
 static inline const char *ocierofs_get_api_registry(const char *registry)
@@ -115,32 +124,102 @@ static size_t ocierofs_write_callback(void *contents, size_t size,
 	return realsize;
 }
 
+static int ocierofs_write_layer_data(struct ocierofs_stream *stream,
+				    const void *contents, size_t size)
+{
+	const char *buf = contents;
+	size_t written = 0;
+
+	while (written < size) {
+		ssize_t n = write(stream->blobfd, buf + written, size - written);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0) {
+			erofs_err("failed to write layer data for layer %s",
+				  stream->digest);
+			return -errno;
+		}
+		if (!n)
+			return -EIO;
+		written += n;
+	}
+	return 0;
+}
+
 static size_t ocierofs_layer_write_callback(void *contents, size_t size,
 					    size_t nmemb, void *userp)
 {
 	struct ocierofs_stream *stream = userp;
 	size_t realsize = size * nmemb;
-	const char *buf = contents;
-	size_t written = 0;
 
 	if (stream->blobfd < 0)
 		return 0;
+	if (!realsize)
+		return 0;
+#ifdef HAVE_ZLIB
+	if (stream->inflate) {
+		unsigned char buf[65536];
+		z_stream *z = &stream->inflater;
 
-	while (written < realsize) {
-		ssize_t n = write(stream->blobfd, buf + written, realsize - written);
-
-		if (n < 0) {
-			erofs_err("failed to write layer data for layer %s",
-				  stream->digest);
+		if (realsize > UINT_MAX) {
+			stream->error = -EOVERFLOW;
 			return 0;
 		}
-		written += n;
+		z->next_in = contents;
+		z->avail_in = (uInt)realsize;
+		do {
+			uInt before = z->avail_in;
+			unsigned int produced;
+			int ret;
+
+			if (stream->stream_end) {
+				Bytef *input = z->next_in;
+				uInt remaining = z->avail_in;
+
+				if (inflateReset(z) != Z_OK) {
+					stream->error = -EIO;
+					return 0;
+				}
+				z->next_in = input;
+				z->avail_in = remaining;
+				stream->stream_end = false;
+			}
+			z->next_out = buf;
+			z->avail_out = sizeof(buf);
+			ret = inflate(z, Z_NO_FLUSH);
+			produced = sizeof(buf) - z->avail_out;
+			stream->error = ocierofs_write_layer_data(stream, buf, produced);
+			if (stream->error)
+				return 0;
+			if (ret == Z_STREAM_END) {
+				stream->stream_end = true;
+				if (!z->avail_in)
+					break;
+			} else if (ret == Z_BUF_ERROR && !before && !produced) {
+				break;
+			} else if ((ret != Z_OK && ret != Z_BUF_ERROR) ||
+				   (before == z->avail_in && !produced)) {
+				stream->error = ret == Z_MEM_ERROR ? -ENOMEM : -EIO;
+				return 0;
+			}
+		} while (z->avail_in || !z->avail_out);
+		return realsize;
 	}
+#endif
+	stream->error = ocierofs_write_layer_data(stream, contents, realsize);
+	if (stream->error)
+		return 0;
 	return realsize;
 }
 
 static int ocierofs_curl_setup_common_options(struct CURL *curl)
 {
+	const char *cacert = getenv("CURL_CA_BUNDLE");
+
+	if (cacert && *cacert &&
+	    curl_easy_setopt(curl, CURLOPT_CAINFO, cacert) != CURLE_OK)
+		return -EIO;
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
@@ -624,7 +703,7 @@ static char *ocierofs_get_manifest_digest(struct ocierofs_ctx *ctx,
 	struct ocierofs_request req = {};
 	struct ocierofs_response resp = {};
 	json_object *root, *manifests, *manifest, *platform_obj, *arch_obj;
-	json_object *os_obj, *digest_obj, *schema_obj, *media_type_obj;
+	json_object *os_obj, *digest_obj, *schema_obj, *media_type_obj, *layers;
 	char *digest = NULL;
 	const char *api_registry;
 	int ret = 0, len, i;
@@ -634,7 +713,7 @@ static char *ocierofs_get_manifest_digest(struct ocierofs_ctx *ctx,
 	     ctx->schema, api_registry, repository, tag) < 0)
 		return ERR_PTR(-ENOMEM);
 
-	if (auth_header && strstr(auth_header, "Bearer"))
+	if (auth_header)
 		req.headers = curl_slist_append(req.headers, auth_header);
 
 	req.headers = curl_slist_append(req.headers,
@@ -675,6 +754,12 @@ static char *ocierofs_get_manifest_digest(struct ocierofs_ctx *ctx,
 			ret = 0;
 			goto out_json;
 		}
+	} else if (json_object_object_get_ex(root, "layers", &layers) &&
+		   json_object_get_type(layers) == json_type_array) {
+		/* The OCI manifest mediaType is optional; indexes use manifests. */
+		digest = strdup(tag);
+		ret = 0;
+		goto out_json;
 	}
 
 	if (!json_object_object_get_ex(root, "manifests", &manifests)) {
@@ -764,7 +849,7 @@ static int ocierofs_fetch_layers_info(struct ocierofs_ctx *ctx)
 		     ctx->schema, api_registry, repository, digest) < 0)
 		return -ENOMEM;
 
-	if (auth_header && strstr(auth_header, "Bearer"))
+	if (auth_header)
 		req.headers = curl_slist_append(req.headers, auth_header);
 
 	req.headers = curl_slist_append(req.headers,
@@ -852,15 +937,17 @@ out:
 	return ret;
 }
 
-static int ocierofs_process_tar_stream(struct erofs_importer *importer, int fd,
+static int ocierofs_process_tar_stream(struct erofs_importer *importer, int *fd,
 				       const struct ocierofs_config *config,
-				       u64 *tar_offset_out)
+				       u32 layer, u64 *tar_offset_out,
+				       bool direct, u64 start)
 {
-	struct erofs_tarfile tarfile = {};
+	struct erofs_tarfile tarfile = { .aufs = true, .layer = layer };
 	int ret, decoder, zinfo_fd;
 	struct erofs_vfile vf;
 
 	init_list_head(&tarfile.global.xattrs);
+	init_list_head(&tarfile.whiteouts);
 
 	/*
 	 * Choose decoder based on config:
@@ -868,7 +955,9 @@ static int ocierofs_process_tar_stream(struct erofs_importer *importer, int fd,
 	 * - tarindex only -> tar (no decoder, raw)
 	 * - neither -> default gzip decoder
 	 */
-	if (config && config->tarindex_path) {
+	if (direct) {
+		decoder = EROFS_IOS_DECODER_NONE;
+	} else if (config && config->tarindex_path) {
 		tarfile.index_mode = true;
 		if (config->zinfo_path)
 			decoder = EROFS_IOS_DECODER_GZRAN;
@@ -878,17 +967,37 @@ static int ocierofs_process_tar_stream(struct erofs_importer *importer, int fd,
 		decoder = EROFS_IOS_DECODER_GZIP;
 	}
 
-	ret = erofs_iostream_open(&tarfile.ios, fd, decoder);
+	ret = erofs_iostream_open(&tarfile.ios, *fd, decoder);
 	if (ret) {
 		erofs_err("failed to initialize tar stream: %s",
 			  erofs_strerror(ret));
 		return ret;
 	}
+	if (direct) {
+		tarfile.ios.borrowed_fd = true;
+		tarfile.direct_data = true;
+		tarfile.offset = start;
+		ret = erofs_iostream_lskip(&tarfile.ios, start);
+		if (ret) {
+			erofs_iostream_close(&tarfile.ios);
+			return -EIO;
+		}
+	}
+	/* GZRAN borrows the fd; the other decoders close it with the stream. */
+	if (!direct && decoder != EROFS_IOS_DECODER_GZRAN)
+		*fd = -1;
 
 	do {
 		ret = tarerofs_parse_tar(importer, &tarfile);
 		/* Continue parsing until end of archive */
 	} while (!ret);
+	if (layer) {
+		int err = tarerofs_finish_layer(importer, &tarfile,
+						ret >= 0 || ret == -ENODATA);
+
+		if (err)
+			ret = err;
+	}
 
 	if (decoder == EROFS_IOS_DECODER_GZRAN) {
 		zinfo_fd = erofs_os_open(config->zinfo_path,
@@ -934,16 +1043,22 @@ static int ocierofs_prepare_auth(struct ocierofs_ctx *ctx,
 	auth_header = ocierofs_get_auth_token(ctx, ctx->registry,
 					      ctx->repository,
 					      username, password);
-	if (!IS_ERR(auth_header)) {
+	if (auth_header && !IS_ERR(auth_header)) {
 		ctx->auth_header = auth_header;
 		return 0;
 	}
 
 	if (username && password && *username && *password) {
-		ret = ocierofs_curl_setup_basic_auth(ctx->curl,
-						    username, password);
-		if (ret)
-			return ret;
+		char *encoded = ocierofs_encode_userpass(username, password);
+
+		if (IS_ERR(encoded))
+			return PTR_ERR(encoded);
+		ret = asprintf(&ctx->auth_header, "Authorization: Basic %s", encoded);
+		free(encoded);
+		if (ret < 0) {
+			ctx->auth_header = NULL;
+			return -ENOMEM;
+		}
 		ctx->using_basic = true;
 	}
 	return 0;
@@ -1051,7 +1166,7 @@ out_auth:
  */
 static int ocierofs_parse_ref(struct ocierofs_ctx *ctx, const char *ref_str)
 {
-	const char *slash, *colon, *dot;
+	const char *slash, *colon, *dot, *digest;
 	const char *repo_part;
 	size_t len;
 	char *tmp;
@@ -1080,8 +1195,16 @@ static int ocierofs_parse_ref(struct ocierofs_ctx *ctx, const char *ref_str)
 	}
 
 	colon = strchr(repo_part, ':');
-	if (colon) {
-		len = colon - repo_part;
+	digest = strchr(repo_part, '@');
+	if (digest || colon) {
+		/* The digest colon belongs to the reference, not the repository. */
+		const char *end = digest ?: colon;
+
+		if (digest && colon && colon < digest)
+			end = colon;
+		len = end - repo_part;
+		if (!len || !(digest ? digest[1] : colon[1]))
+			return -EINVAL;
 		tmp = erofs_os_strndup(repo_part, len);
 	} else {
 		tmp = strdup(repo_part);
@@ -1104,9 +1227,9 @@ static int ocierofs_parse_ref(struct ocierofs_ctx *ctx, const char *ref_str)
 	free(ctx->repository);
 	ctx->repository = tmp;
 
-	if (colon) {
+	if (digest || colon) {
 		free(ctx->tag);
-		ctx->tag = strdup(colon + 1);
+		ctx->tag = strdup((digest ?: colon) + 1);
 		if (!ctx->tag)
 			return -ENOMEM;
 	}
@@ -1203,7 +1326,7 @@ int ocierofs_ctx_init(struct ocierofs_ctx *ctx, const struct ocierofs_config *co
 static int ocierofs_download_blob_to_fd(struct ocierofs_ctx *ctx,
 					const char *digest,
 					const char *auth_header,
-					int outfd)
+					int outfd, bool ungzip)
 {
 	struct ocierofs_request req = {};
 	struct ocierofs_stream stream = {};
@@ -1215,13 +1338,26 @@ static int ocierofs_download_blob_to_fd(struct ocierofs_ctx *ctx,
 		.digest = digest,
 		.blobfd = outfd,
 	};
+#ifdef HAVE_ZLIB
+	if (ungzip) {
+		ret = inflateInit2(&stream.inflater, MAX_WBITS + 16);
+		if (ret != Z_OK)
+			return ret == Z_MEM_ERROR ? -ENOMEM : -EIO;
+		stream.inflate = true;
+	}
+#else
+	if (ungzip)
+		return -EOPNOTSUPP;
+#endif
 
 	api_registry = ocierofs_get_api_registry(ctx->registry);
 	if (asprintf(&req.url, "%s%s/v2/%s/blobs/%s",
-	     ctx->schema, api_registry, ctx->repository, digest) == -1)
-		return -ENOMEM;
+	     ctx->schema, api_registry, ctx->repository, digest) == -1) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
-	if (auth_header && strstr(auth_header, "Bearer"))
+	if (auth_header)
 		req.headers = curl_slist_append(req.headers, auth_header);
 
 	curl_easy_reset(ctx->curl);
@@ -1238,6 +1374,8 @@ static int ocierofs_download_blob_to_fd(struct ocierofs_ctx *ctx,
 		goto out;
 
 	ret = ocierofs_curl_perform(ctx->curl, &http_code);
+	if (stream.error)
+		ret = stream.error;
 	if (ret)
 		goto out;
 
@@ -1247,7 +1385,17 @@ static int ocierofs_download_blob_to_fd(struct ocierofs_ctx *ctx,
 		goto out;
 	}
 	ret = 0;
+#ifdef HAVE_ZLIB
+	if (ungzip && !stream.stream_end) {
+		erofs_err("incomplete gzip layer %s", digest);
+		ret = -EIO;
+	}
+#endif
 out:
+#ifdef HAVE_ZLIB
+	if (stream.inflate)
+		inflateEnd(&stream.inflater);
+#endif
 	ocierofs_request_cleanup(&req);
 	return ret;
 }
@@ -1269,7 +1417,8 @@ static int ocierofs_extract_layer(struct ocierofs_ctx *ctx,
 	}
 	stream.blobfd = ret;
 
-	ret = ocierofs_download_blob_to_fd(ctx, digest, auth_header, stream.blobfd);
+	ret = ocierofs_download_blob_to_fd(ctx, digest, auth_header,
+					 stream.blobfd, false);
 	if (ret)
 		goto out;
 
@@ -1317,6 +1466,31 @@ void ocierofs_ctx_cleanup(struct ocierofs_ctx *ctx)
 	free(ctx->blob_digest);
 }
 
+static int ocierofs_normalize_root(struct erofs_importer *importer)
+{
+	erofs_os_stat_t st = { .st_mode = S_IFDIR | 0755 };
+	int ret = __erofs_fill_inode(importer, importer->root, &st, "/");
+
+	if (!ret)
+		importer->root->i_mode = st.st_mode;
+	return ret;
+}
+
+static int ocierofs_layer_decoder(const char *type)
+{
+	size_t len;
+
+	if (!type)
+		return -EOPNOTSUPP;
+	len = strlen(type);
+	if ((len >= 5 && !strcmp(type + len - 5, "+gzip")) ||
+	    (len >= 5 && !strcmp(type + len - 5, ".gzip")))
+		return EROFS_IOS_DECODER_GZIP;
+	if (len >= 4 && !strcmp(type + len - 4, ".tar"))
+		return EROFS_IOS_DECODER_NONE;
+	return -EOPNOTSUPP;
+}
+
 int ocierofs_build_trees(struct erofs_importer *importer,
 			 const struct ocierofs_config *config)
 {
@@ -1348,22 +1522,74 @@ int ocierofs_build_trees(struct erofs_importer *importer,
 		ret = -EINVAL;
 		goto out;
 	}
+	if (!ctx.blob_digest && !config->tarindex_path) {
+		ret = ocierofs_normalize_root(importer);
+		if (ret)
+			goto out;
+	}
 
 	while (i < end) {
+		int decoder = ocierofs_layer_decoder(ctx.layers[i]->media_type);
+		bool direct = !config->tarindex_path && !importer->params->chunkszbits_def &&
+			!cfg.c_dry_run && decoder >= 0;
+		s64 start = 0;
 		char *trimmed = erofs_trim_for_progressinfo(ctx.layers[i]->digest,
 				sizeof("Extracting layer  ...") - 1);
 		erofs_update_progressinfo("Extracting layer %s ...", trimmed);
 		free(trimmed);
-		fd = ocierofs_extract_layer(&ctx, ctx.layers[i]->digest,
-					    ctx.auth_header);
+		if (direct) {
+			if (!importer->tar_source) {
+				struct erofs_vfile *source = calloc(1, sizeof(*source));
+
+				if (!source) {
+					ret = -ENOMEM;
+					break;
+				}
+				source->fd = erofs_os_tmpfile();
+				if (source->fd < 0) {
+					ret = source->fd;
+					free(source);
+					break;
+				}
+				importer->tar_source = source;
+			}
+			fd = importer->tar_source->fd;
+			start = erofs_os_lseek(fd, 0, SEEK_END);
+			if (start < 0) {
+				ret = -errno;
+				break;
+			}
+			/* Keep each layer's header aligned even with nonstandard tails. */
+			if (start & 511) {
+				start = round_up(start, 512);
+				ret = erofs_io_ftruncate(importer->tar_source, start);
+				if (ret)
+					break;
+				if (erofs_os_lseek(fd, start, SEEK_SET) < 0) {
+					ret = -errno;
+					break;
+				}
+			}
+			ret = ocierofs_download_blob_to_fd(&ctx,
+				ctx.layers[i]->digest, ctx.auth_header, fd,
+				decoder == EROFS_IOS_DECODER_GZIP);
+			if (ret)
+				break;
+		} else {
+			fd = ocierofs_extract_layer(&ctx, ctx.layers[i]->digest,
+						    ctx.auth_header);
+		}
 		if (fd < 0) {
 			erofs_err("failed to extract layer %s: %s",
 				  ctx.layers[i]->digest, erofs_strerror(fd));
 			ret = fd;
 			break;
 		}
-		ret = ocierofs_process_tar_stream(importer, fd, config, &tar_offset);
-		close(fd);
+		ret = ocierofs_process_tar_stream(importer, &fd, config,
+			ctx.blob_digest || config->tarindex_path ? 0 : (u32)i + 1,
+			&tar_offset, direct, start);
+		if (!direct && fd >= 0)
+			close(fd);
 		if (ret) {
 			erofs_err("failed to process tar stream for layer %s: %s",
 				  ctx.layers[i]->digest, erofs_strerror(ret));
@@ -1371,6 +1597,8 @@ int ocierofs_build_trees(struct erofs_importer *importer,
 		}
 		i++;
 	}
+	if (!ret && !ctx.blob_digest && !config->tarindex_path)
+		ret = ocierofs_normalize_root(importer);
 out:
 	if (config->tarindex_path && importer->sbi)
 		importer->sbi->devs[0].blocks = BLK_ROUND_UP(importer->sbi, tar_offset);
@@ -1422,7 +1650,7 @@ static int ocierofs_download_blob_range(struct ocierofs_ctx *ctx, off_t offset, 
 		snprintf(rangehdr, sizeof(rangehdr), "Range: bytes=%lld-",
 			 (long long)offset);
 
-	if (ctx->auth_header && strstr(ctx->auth_header, "Bearer"))
+	if (ctx->auth_header)
 		req.headers = curl_slist_append(req.headers, ctx->auth_header);
 	req.headers = curl_slist_append(req.headers, rangehdr);
 

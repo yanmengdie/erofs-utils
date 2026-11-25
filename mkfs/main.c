@@ -308,7 +308,7 @@ static struct erofs_s3 s3cfg;
 #endif
 
 #ifdef OCIEROFS_ENABLED
-static struct ocierofs_config ocicfg;
+static struct ocierofs_config ocicfg = { .layer_index = -1 };
 #endif
 static bool mkfs_oci_tarindex_mode;
 

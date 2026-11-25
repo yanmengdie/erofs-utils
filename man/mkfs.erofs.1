@@ -351,6 +351,13 @@ Specify the prefix of target filesystem path (default: /).
 .TP
 .BI "\-\-oci\fR[\fP=<f|i>\fR]\fP"
 Generate a full (f) or index-only (i) image from OCI remote source.
+The source may be a tagged reference or an image digest reference
+(for example, registry/repository@sha256:...).
+When importing all layers, whiteouts and opaque directories affect only lower
+layers; entries added in the same layer are retained.
+The merged root directory is normalized to uid/gid 0, mode 0755 and epoch
+mtime; explicit uid/gid and timestamp options still apply.
+The CURL_CA_BUNDLE environment variable specifies a custom registry CA bundle.
 Additional options can be specified:
 .RS 1.2i
 .TP
